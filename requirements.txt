@@ -1,0 +1,11 @@
+# Core optimisation libraries (no commercial licence required)
+pulp>=2.7
+pyomo>=6.7
+
+# Optional commercial solvers (install separately)
+# gurobipy     # Gurobi — best performance, requires licence
+# cplex        # IBM CPLEX — requires licence
+# highspy      # HiGHS — free, state-of-the-art open solver
+
+# Utilities
+dataclasses; python_version < "3.7"
