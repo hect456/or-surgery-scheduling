@@ -1,21 +1,15 @@
 """
 reporter.py — Human-readable schedule output.
 
-Produces the terminal output requested by the interview problem:
+Produces the terminal output requested by the case study:
   "a plain terminal output ... is plenty".
-
-Format mirrors the structure used by Marques & Captivo (2015)
-for their computational results presentation.
 """
 
 from __future__ import annotations
 from collections import defaultdict
 from typing import Dict, List
 
-from ..model.types import (
-    PlanningInstance, SolverResult, SurgicalCase, DAYS,
-)
-from ..model.penalty import compute_all_penalties
+from ..model.types import PlanningInstance, SolverResult
 
 
 # ANSI colour codes (auto-disabled if terminal doesn't support them)
@@ -42,10 +36,15 @@ def print_header(instance: PlanningInstance) -> None:
     print(f"  Rooms    : {len(instance.rooms)}")
     print(f"  Surgeons : {len(instance.surgeons)}")
     print(f"  Horizon  : {', '.join(instance.days)}")
-    overdue = sum(1 for c in instance.cases if c.is_overdue)
+    overdue = sum(1 for c in instance.cases if instance.is_overdue(c))
     urgent  = sum(1 for c in instance.cases if c.must_schedule_day1)
     print(f"  Overdue  : {RED(str(overdue))} cases already past deadline")
-    print(f"  P4 (must Mon): {YELLOW(str(urgent))} cases")
+    print(f"  Priority-4 (must day 1): {YELLOW(str(urgent))} cases")
+    if instance.has_equipment_limits():
+        print(f"  Shared equipment tracked: {sorted({e for e, _ in instance.equipment_capacity})}")
+    if instance.has_bed_limits():
+        print(f"  Downstream recovery beds tracked: "
+              f"{sorted({t for t, _ in instance.bed_capacity})}  (production model only)")
     print()
 
 
@@ -53,7 +52,6 @@ def print_result(result: SolverResult, instance: PlanningInstance) -> None:
     case_map = instance.cases_by_id
     room_map = instance.rooms_by_id
 
-    # Group assignments by day
     by_day: Dict[str, list] = defaultdict(list)
     for a in result.assignments:
         by_day[a.day].append(a)
@@ -75,18 +73,19 @@ def print_result(result: SolverResult, instance: PlanningInstance) -> None:
         print(f"  {'─'*68}")
         if not entries:
             print("    (no cases scheduled)")
-        for a in sorted(entries, key=lambda a: (a.room_id, a.case_id)):
+        for a in sorted(entries, key=lambda a: (a.room_id, a.start_min or 0, a.case_id)):
             c   = case_map[a.case_id]
-            r   = room_map[a.room_id]
-            dtd = c.days_to_deadline
+            dtd = instance.days_to_deadline(c)
             dtd_str = (RED(f"OVERDUE {abs(dtd)}d") if dtd < 0
                        else YELLOW(f"+{dtd}d")     if dtd <= 5
                        else GREEN(f"+{dtd}d"))
-            prio_str = {1:"P1",2:"P2",3:"P3",4:YELLOW("P4")}[c.priority.value]
+            prio_str = {1: "P1", 2: "P2", 3: "P3", 4: YELLOW("P4")}[c.priority.value]
+            time_str = (f"{a.start_min:3d}-{a.end_min:3d}min" if a.start_min is not None else f"{c.t_cir:3d}min")
+            equip_str = f" [{c.equipment}]" if c.equipment else ""
             print(
                 f"    [{a.case_id}]  {c.service:6s}  {a.room_id:10s}  "
                 f"{c.surgeon_id:10s}  {prio_str}  "
-                f"{c.t_cir:3d}min  {dtd_str}"
+                f"{time_str}  {dtd_str}{equip_str}"
             )
         print()
 
@@ -97,7 +96,7 @@ def print_result(result: SolverResult, instance: PlanningInstance) -> None:
         print(f"  {'─'*68}")
         for cid in result.unscheduled_case_ids:
             c   = case_map[cid]
-            dtd = c.days_to_deadline
+            dtd = instance.days_to_deadline(c)
             dtd_str = RED(f"OVERDUE {abs(dtd)}d") if dtd < 0 else f"+{dtd}d"
             print(f"    [{cid}]  {c.service}  P{c.priority.value}  {dtd_str}")
         print()
@@ -111,7 +110,6 @@ def print_result(result: SolverResult, instance: PlanningInstance) -> None:
         c = case_map[a.case_id]
         room_used[a.room_id] += c.t_tot
 
-    room_map_obj = instance.rooms_by_id
     for r in instance.rooms:
         total_cap = sum(r.capacity_min.values())
         used      = room_used.get(r.id, 0)
@@ -153,13 +151,13 @@ def _check_constraints(result: SolverResult, instance: PlanningInstance) -> None
 
     scheduled = {a.case_id: a for a in result.assignments}
 
-    # (5.2) All priority-4 on day 1
+    # Priority EMERGENT_ADDON on day 1
     d1 = instance.days[0]
     for c in instance.cases:
         if c.must_schedule_day1:
             a = scheduled.get(c.id)
             if a is None or a.day != d1:
-                print(f"  {RED('✗')} [{c.id}] Priority-4 not on {d1}")
+                print(f"  {RED('✗')} [{c.id}] Priority-4 case not on {d1}")
                 ok = False
     if all(
         (a := scheduled.get(c.id)) is not None and a.day == d1
@@ -167,18 +165,17 @@ def _check_constraints(result: SolverResult, instance: PlanningInstance) -> None
     ):
         print(f"  {GREEN('✓')} All priority-4 cases scheduled on {d1}")
 
-    # (5.6) Paediatric ORL circuit
+    # Pediatric block
     paed_viol = False
     for a in result.assignments:
         c = case_map[a.case_id]
-        if instance.is_paediatric_day(c, a.day):
-            print(f"  {RED('✗')} [{c.id}] Adult ORL on paediatric day")
+        if instance.violates_pediatric_block(c, a.day):
+            print(f"  {RED('✗')} [{c.id}] breaches pediatric-block rule")
             paed_viol = True; ok = False
     if not paed_viol:
-        print(f"  {GREEN('✓')} Paediatric circuit respected")
+        print(f"  {GREEN('✓')} Pediatric-block rule respected")
 
-    # (5.7) Room capacity
-    from collections import defaultdict
+    # Room capacity
     room_day_load: Dict = defaultdict(int)
     for a in result.assignments:
         c = case_map[a.case_id]
@@ -192,7 +189,7 @@ def _check_constraints(result: SolverResult, instance: PlanningInstance) -> None
     if cap_ok:
         print(f"  {GREEN('✓')} All room capacities respected")
 
-    # (5.8/5.9) Surgeon limits
+    # Surgeon limits
     surg_day_load: Dict = defaultdict(int)
     surg_week_load: Dict = defaultdict(int)
     for a in result.assignments:
@@ -212,6 +209,61 @@ def _check_constraints(result: SolverResult, instance: PlanningInstance) -> None
             surg_ok = False; ok = False
     if surg_ok:
         print(f"  {GREEN('✓')} All surgeon time limits respected")
+
+    # Shared equipment — semantics depend on whether the solver reports
+    # exact start/end times (CP-SAT: concurrent-units check) or only a
+    # day+room bucket (baseline MILP/greedy: daily-headcount check).
+    if instance.has_equipment_limits():
+        equip_ok = True
+        has_times = any(a.start_min is not None for a in result.assignments)
+        if has_times:
+            by_equip_day: Dict = defaultdict(list)
+            for a in result.assignments:
+                c = case_map[a.case_id]
+                if c.equipment is not None:
+                    by_equip_day[c.equipment, a.day].append((a.start_min, a.end_min))
+            for (e, d), spans in by_equip_day.items():
+                cap = instance.equipment_capacity.get((e, d))
+                if cap is None:
+                    continue
+                events = sorted([(s, 1) for s, _ in spans] + [(t, -1) for _, t in spans])
+                running = max_running = 0
+                for _, delta in events:
+                    running += delta
+                    max_running = max(max_running, running)
+                if max_running > cap:
+                    print(f"  {RED('✗')} Equipment {e} on {d}: {max_running} concurrent > {cap} capacity")
+                    equip_ok = False; ok = False
+        else:
+            equip_load: Dict = defaultdict(int)
+            for a in result.assignments:
+                c = case_map[a.case_id]
+                if c.equipment is not None:
+                    equip_load[c.equipment, a.day] += 1
+            for (e, d), count in equip_load.items():
+                cap = instance.equipment_capacity.get((e, d))
+                if cap is not None and count > cap:
+                    print(f"  {RED('✗')} Equipment {e} on {d}: {count} cases > {cap} capacity")
+                    equip_ok = False; ok = False
+        if equip_ok:
+            print(f"  {GREEN('✓')} Shared equipment capacity respected")
+
+    # No-overlap (only meaningful when the solver reports start/end times)
+    has_times = any(a.start_min is not None for a in result.assignments)
+    if has_times:
+        overlap_ok = True
+        by_room_day: Dict = defaultdict(list)
+        for a in result.assignments:
+            by_room_day[a.day, a.room_id].append(a)
+        for key, items in by_room_day.items():
+            items_sorted = sorted(items, key=lambda a: a.start_min)
+            for prev, cur in zip(items_sorted, items_sorted[1:]):
+                if prev.end_min > cur.start_min:
+                    print(f"  {RED('✗')} Overlap in room {key[1]} on {key[0]}: "
+                          f"{prev.case_id} ends {prev.end_min}, {cur.case_id} starts {cur.start_min}")
+                    overlap_ok = False; ok = False
+        if overlap_ok:
+            print(f"  {GREEN('✓')} No within-room time overlaps (exact interval check)")
 
     if ok:
         print(f"  {GREEN('✓')} All constraints verified — solution is feasible")

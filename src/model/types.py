@@ -1,8 +1,15 @@
 """
 types.py — Core data structures for the Elective Surgery Scheduling problem.
 
-Based on the CHLN formulation (Marques & Captivo, 2015) and adapted for the
-generic OR scheduling context requested by the interview problem.
+Generic, hospital-agnostic data model. The priority + maximum-wait-time +
+penalty-multiplier mechanism below is not specific to any one institution —
+it mirrors how several public health systems prioritise elective waiting
+lists in practice (e.g. Portugal's SIGIC, the UK NHS Referral-to-Treatment
+targets, Canadian provincial wait-time benchmarks). We use that mechanism
+because it is evidence-based, not because this model targets any one of
+those systems — every numeric value below is an instance-level default,
+overridable per hospital (see PlanningInstance.max_wait_days /
+priority_multiplier).
 
 Design decision: plain dataclasses (no ORM, no external deps) so the model
 layer is solver-agnostic and testable in isolation.
@@ -20,43 +27,49 @@ from typing import Dict, List, Optional, Tuple
 
 class Priority(IntEnum):
     """
-    SIGIC clinical priority levels (SNS Portugal).
-    Lower numeric = less urgent from a scheduling perspective
-    (but higher weight in the objective when the deadline is missed).
+    Clinical priority of a case. Higher = more urgent, shorter maximum
+    clinically-acceptable wait. Level 4 is treated as a hard constraint
+    (must be scheduled on the first day of the horizon) rather than a
+    soft tardiness penalty, since by the time the case reaches the
+    planner its remaining slack is already (near) zero.
     """
-    NORMAL            = 1   # wl_max = 270 days
-    PRIORITY          = 2   # wl_max = 60  days
-    VERY_PRIORITY     = 3   # wl_max = 15  days
-    DEFERRED_URGENT   = 4   # wl_max = 3   days  → must schedule on day 1
+    ROUTINE        = 1   # long elective wait acceptable
+    ELEVATED       = 2   # shorter wait window
+    URGENT         = 3   # short wait window
+    EMERGENT_ADDON = 4   # must be done on day 1 of the horizon
 
 
 class SurgeryScope(IntEnum):
-    CONVENTIONAL = 1   # inpatient overnight
+    CONVENTIONAL = 1   # inpatient, overnight stay expected
     AMBULATORY   = 2   # day-case, same-day discharge
 
 
 # ──────────────────────────────────────────────────────────────
-# Parameters (read-only after construction)
+# Default parameters (evidence-informed, instance-overridable)
 # ──────────────────────────────────────────────────────────────
 
-# Maximum waiting days per priority (SIGIC Portaria n.º 45/2008)
-MAX_WAIT_DAYS: Dict[Priority, int] = {
-    Priority.NORMAL:          270,
-    Priority.PRIORITY:         60,
-    Priority.VERY_PRIORITY:    15,
-    Priority.DEFERRED_URGENT:   3,
+# Maximum clinically-acceptable waiting days per priority level.
+# Defaults are loosely modelled on public-system wait-time tiers
+# (e.g. SIGIC Portaria n.º 45/2008); treat as a configurable starting
+# point, not a universal constant — every PlanningInstance can override it.
+DEFAULT_MAX_WAIT_DAYS: Dict[Priority, int] = {
+    Priority.ROUTINE:        270,
+    Priority.ELEVATED:        60,
+    Priority.URGENT:           15,
+    Priority.EMERGENT_ADDON:    3,
 }
 
-# Relative penalty multipliers (Tabela 5.1, Marques & Captivo 2015)
-# Interpretation: 1 day overdue in priority p ≡ MULTIPLIER[p] days overdue in priority 1.
-PRIORITY_MULTIPLIER: Dict[Priority, float] = {
-    Priority.NORMAL:         1.0,
-    Priority.PRIORITY:       4.5,
-    Priority.VERY_PRIORITY: 18.0,
-    Priority.DEFERRED_URGENT: 90.0,
+# Relative penalty multipliers for the tardiness objective.
+# Interpretation: 1 overdue day at priority p ≡ MULTIPLIER[p] overdue
+# days at priority ROUTINE. Same evidence basis as above.
+DEFAULT_PRIORITY_MULTIPLIER: Dict[Priority, float] = {
+    Priority.ROUTINE:         1.0,
+    Priority.ELEVATED:        4.5,
+    Priority.URGENT:         18.0,
+    Priority.EMERGENT_ADDON: 90.0,
 }
 
-DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri"]   # D = {1..5}
+DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri"]   # D = {1..5}, one work week
 
 
 # ──────────────────────────────────────────────────────────────
@@ -66,18 +79,22 @@ DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri"]   # D = {1..5}
 @dataclass
 class Surgeon:
     """
-    h ∈ H.  A surgeon is identified by ID and constrained by daily/weekly
-    operative time limits (k_{hd}^{dia} and k_h^{sem} in the formulation).
+    h ∈ H. A surgeon is identified by ID and constrained by daily/weekly
+    operative time limits (k_{hd}^{day} and k_h^{week} in the formulation).
 
-    k_{hd}^{dia} = min(surgeon daily limit, max room capacity that day)
-    — the smaller of the two prevents scheduling the same surgeon in two
-    rooms simultaneously (Marques & Captivo constraint 5.8 rationale).
+    k_{hd}^{day} is intentionally also bounded by room capacity in the
+    instances we build (min of "surgeon limit" and "max single-room
+    capacity that day") — one linear constraint then does double duty:
+    it both caps overwork AND prevents the same surgeon being scheduled
+    in two rooms at once at the daily-aggregate level. The interval-based
+    production model (see PRODUCTION_FORMULATION.md) replaces this
+    approximation with an exact NoOverlap over the surgeon's intervals.
     """
     id: str
     name: str
-    service: str                          # s_c — surgical service
-    daily_limit_min: int   = 240          # k_{hd}^{dia} (minutes)
-    weekly_limit_min: int  = 960          # k_h^{sem}   (minutes)
+    service: str                          # s_c — surgical service / specialty
+    daily_limit_min: int   = 240          # k_{hd}^{day} (minutes)
+    weekly_limit_min: int  = 960          # k_h^{week}   (minutes)
     # availability[day] = True if surgeon available that day
     availability: Dict[str, bool] = field(default_factory=lambda: {d: True for d in DAYS})
 
@@ -87,27 +104,32 @@ class OperatingRoom:
     """
     r ∈ R_b for block b ∈ B.
     k_{dbr} = capacity in minutes on day d.
-    service_assignment[day] = service code that owns the room that day (from MSS).
-    Only ambulatory-capable rooms may host ambulatory cases.
+    service_assignment[day] = service code that owns the room that day
+    (the room-service roster / "block schedule").
     """
     id: str
-    block: str                        # b ∈ B
-    service_assignment: Dict[str, str]   # day → service code ("" = unassigned)
-    capacity_min: Dict[str, int]         # day → minutes available
-    ambulatory_only: bool = False        # Bloco Ambulatório de Urologia rule (5.5)
+    block: str                            # b ∈ B
+    service_assignment: Dict[str, str]    # day → service code ("" = unassigned)
+    capacity_min: Dict[str, int]          # day → minutes available
+    ambulatory_only: bool = False         # room restricted to day-case procedures
 
 
 @dataclass
 class SurgicalCase:
     """
-    c ∈ C — one patient-surgery pair on the waiting list (LIC).
+    c ∈ C — one patient-procedure pair on the elective waiting list.
 
-    Key parameters from the formulation:
-      t_c^{cir}  = operative time (surgeon presence required)
-      t_c^{lim}  = cleaning/turnover time after case
-      t_c^{tot}  = t_c^{cir} + t_c^{lim}  (room occupation time)
-      dd_c       = deadline = wl_c^{dia} + wl_c^{max}
-                   negative → already overdue on planning day d_1
+    Key time parameters:
+      t_cir   = operative time (surgeon + room occupied)
+      t_clean = cleaning/turnover time after the case
+      t_tot   = t_cir + t_clean  (total room occupation time)
+
+    Optional resources (see PlanningInstance for capacities):
+      equipment      — shared equipment unit required (e.g. a C-arm /
+                        imaging unit), or None if the case needs none.
+      recovery_type  — downstream bed pool required after surgery
+                        ("none" by default; e.g. "icu", "ward").
+      recovery_los_days — length of stay in that bed pool, in days.
     """
     id: str
     patient_id: str
@@ -115,41 +137,45 @@ class SurgicalCase:
     surgeon_id: str
     priority: Priority
     scope: SurgeryScope
-    patient_age: int                  # relevant for ORL paediatric circuit (5.6)
+    patient_age: int
 
     # Time parameters (minutes)
-    t_cir: int                        # t_c^{cir}: operative duration
-    t_clean: int = 20                 # t_c^{lim}: room cleaning time
+    t_cir: int
+    t_clean: int = 20
 
-    # Waiting-list entry (days before planning horizon d_1, positive = already waiting)
+    # Waiting-list entry (days already waited before the planning horizon)
     days_waiting: int = 0
 
-    def __post_init__(self):
-        wl_max = MAX_WAIT_DAYS[self.priority]
-        # dd_c - d_1: positive → days remaining before deadline
-        #             negative → already overdue
-        self.days_to_deadline: int = wl_max - self.days_waiting
+    # Optional shared resources
+    equipment: Optional[str] = None
+    recovery_type: str = "none"
+    recovery_los_days: int = 0
 
     @property
     def t_tot(self) -> int:
-        """Total room occupation: t_c^{cir} + t_c^{lim}."""
+        """Total room occupation: t_c^{cir} + t_c^{clean}."""
         return self.t_cir + self.t_clean
 
     @property
-    def is_overdue(self) -> bool:
-        return self.days_to_deadline < 0
+    def must_schedule_day1(self) -> bool:
+        """Priority EMERGENT_ADDON must be scheduled on the first planning day."""
+        return self.priority == Priority.EMERGENT_ADDON
 
     @property
-    def must_schedule_day1(self) -> bool:
-        """Priority 4 must be scheduled on the first planning day."""
-        return self.priority == Priority.DEFERRED_URGENT
+    def needs_recovery_bed(self) -> bool:
+        return self.recovery_type != "none" and self.recovery_los_days > 0
 
 
 @dataclass
 class PlanningInstance:
     """
     Complete problem instance: all sets and parameters needed by any solver.
-    Mirrors the mathematical sets C, D, B, R_b, S, N, H from Chapter 5.
+    Mirrors the mathematical sets C, D, B, R_b, S, H from FORMULATION.md.
+
+    max_wait_days / priority_multiplier are instance-level so each hospital
+    can plug in its own waiting-list policy without touching solver code —
+    this is the "adaptable" part of the model (see DEFAULT_* above for the
+    evidence-informed starting point we ship with).
     """
     name: str
     cases: List[SurgicalCase]
@@ -157,10 +183,24 @@ class PlanningInstance:
     rooms: List[OperatingRoom]
     days: List[str] = field(default_factory=lambda: list(DAYS))
 
-    # Special rules (can be overridden per instance)
-    paediatric_age_limit: int = 8      # ORL Friday paediatric circuit (5.6)
-    paediatric_service: str = "ORL"
-    paediatric_day: str = "Fri"
+    max_wait_days: Dict[Priority, int] = field(
+        default_factory=lambda: dict(DEFAULT_MAX_WAIT_DAYS))
+    priority_multiplier: Dict[Priority, float] = field(
+        default_factory=lambda: dict(DEFAULT_PRIORITY_MULTIPLIER))
+
+    # Optional shared resources. Empty dict = resource unconstrained/unused.
+    # equipment_capacity[(equipment_id, day)]   = units available that day
+    # bed_capacity[(recovery_type, day)]        = beds available that day
+    equipment_capacity: Dict[Tuple[str, str], int] = field(default_factory=dict)
+    bed_capacity: Dict[Tuple[str, str], int] = field(default_factory=dict)
+
+    # Optional site-specific room-day eligibility rule: (service, day, age_limit).
+    # On that day, that service's rooms may only host patients with
+    # patient_age <= age_limit (e.g. a designated paediatric block).
+    # None = rule disabled. This shows how an ad hoc institutional carve-out
+    # plugs in as one extra eligibility predicate without touching the core
+    # formulation — real hospitals accumulate rules like this constantly.
+    pediatric_block: Optional[Tuple[str, str, int]] = None
 
     alpha: float = 2.0                 # α > 1: urgency multiplier for overdue cases
 
@@ -172,7 +212,7 @@ class PlanningInstance:
         for c in self.cases:
             assert c.surgeon_id in surgeon_ids, \
                 f"Case {c.id}: unknown surgeon {c.surgeon_id}"
-        assert self.alpha > 1.0, "α must be > 1"
+        assert self.alpha > 1.0, "alpha must be > 1"
 
     # ── Convenience lookups ──────────────────────
     @property
@@ -198,13 +238,30 @@ class PlanningInstance:
         svc = room.service_assignment.get(day, "")
         return svc == case.service
 
-    def is_paediatric_day(self, case: SurgicalCase, day: str) -> bool:
-        """Rule 5.6: on the paediatric day, only young patients may use ORL rooms."""
-        return (
-            day == self.paediatric_day
-            and case.service == self.paediatric_service
-            and case.patient_age > self.paediatric_age_limit
-        )
+    def violates_pediatric_block(self, case: SurgicalCase, day: str) -> bool:
+        """True if scheduling this case on this day would breach the
+        optional pediatric-block eligibility rule (see pediatric_block)."""
+        if self.pediatric_block is None:
+            return False
+        svc, blocked_day, age_limit = self.pediatric_block
+        return day == blocked_day and case.service == svc and case.patient_age > age_limit
+
+    # ── Priority / deadline accessors (instance-configured) ──────────
+    def max_wait(self, case: SurgicalCase) -> int:
+        return self.max_wait_days[case.priority]
+
+    def days_to_deadline(self, case: SurgicalCase) -> int:
+        """dd_c - d_1: positive = days of slack left, negative = already overdue."""
+        return self.max_wait(case) - case.days_waiting
+
+    def is_overdue(self, case: SurgicalCase) -> bool:
+        return self.days_to_deadline(case) < 0
+
+    def has_equipment_limits(self) -> bool:
+        return bool(self.equipment_capacity)
+
+    def has_bed_limits(self) -> bool:
+        return bool(self.bed_capacity) and any(c.needs_recovery_bed for c in self.cases)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -213,10 +270,21 @@ class PlanningInstance:
 
 @dataclass
 class Assignment:
-    """A scheduled surgery: case c → day d, room r."""
+    """
+    A scheduled surgery: case c -> day d, room r.
+
+    start_min / end_min are optional clock times *within the day*
+    (minutes from room opening). The baseline MILP only reasons at
+    day+room granularity and leaves these as None; the interval-based
+    CP-SAT production model fills them in, since it schedules exact
+    start times — this is the concrete, reportable difference between
+    the two formulations.
+    """
     case_id: str
     day: str
     room_id: str
+    start_min: Optional[int] = None
+    end_min: Optional[int] = None
 
 
 @dataclass
@@ -227,7 +295,7 @@ class SolverResult:
     unscheduled_case_ids: List[str]
     solve_time_sec: float
     solver_name: str
-    gap: Optional[float] = None              # MIP gap (if available)
+    gap: Optional[float] = None              # MIP/CP gap (if available)
 
     def is_optimal(self) -> bool:
         return self.status.lower() in {"optimal", "feasible"}

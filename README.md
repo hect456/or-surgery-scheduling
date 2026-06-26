@@ -1,40 +1,43 @@
-# Elective Surgery Scheduling — MILP Model & Demo Solver
+# Elective Surgery Scheduling — Baseline MILP + Production Interval-CP
 
-**Operations Research · Healthcare Scheduling · Portuguese NHS (SNS/SIGIC)**
+> A weekly elective-surgery scheduling model for a large hospital group, built as two
+> formulations: a baseline MILP and a production-grade interval-based Constraint
+> Programming model — solved with **Google OR-Tools** (linear_solver/CBC + SCIP,
+> CP-SAT), **Gurobi**, and (optionally) **Hexaly**.
 
-> A rigorous Mixed-Integer Linear Programme for weekly elective surgery planning,
-> grounded in CHLN operational data and SIGIC clinical priority rules (Portaria n.º 45/2008).
+Read **[FORMULATION.md](FORMULATION.md)** first (the baseline math), then
+**[PRODUCTION_FORMULATION.md](PRODUCTION_FORMULATION.md)** (the interval-based upgrade),
+then **[RESULTS.md](RESULTS.md)** (the benchmark numbers below, with analysis).
 
 ---
 
 ## Quick Start
 
 ```bash
-# 1. Install dependencies (no commercial licence required)
-pip install pulp pyomo
+# Core dependency — bundles CBC + SCIP (no external solver binary needed) and CP-SAT
+pip install ortools
 
-# Optional open-source: pip install highspy
-# Optional commercial:  pip install gurobipy  |  pip install cplex
+# Optional: commercial backend for the baseline MILP (requires a license)
+pip install gurobipy
 
-# 2. Run the 20-case demo (PuLP/CBC — always available)
+# Optional: third point of the trade-off triangle (requires an academic license —
+# see src/solvers/hexaly_solver.py for setup; falls back to CBC if absent)
+pip install hexaly
+
+# Run the 20-case demo (OR-Tools/CBC baseline)
 python main.py
 
-# 3. Compare all available solvers
-python main.py --compare
+# Run the interval-based production model instead
+python main.py --solver cp-sat
 
-# 4. Larger instances
-python main.py --instance small        # 50 cases, 4 services
-python main.py --instance literature   # ~60 cases, Cardoen benchmark structure
+# Run the ~200-case scaling instance
+python main.py --instance medium --solver cp-sat
 
-# 5. Choose backend
-python main.py --solver pyomo-cbc
-python main.py --solver pyomo-glpk
-python main.py --solver pyomo-gurobi   # requires gurobipy + licence
-python main.py --solver pyomo-cplex    # requires cplex + licence
-python main.py --solver pyomo-highs    # pip install highspy
-python main.py --solver greedy         # milliseconds, no solver needed
+# Run every backend and print a comparison table (this is what RESULTS.md is built from)
+python main.py --instance demo --benchmark
+python main.py --instance medium --benchmark --time-limit 60
 
-# 6. Run tests
+# Run the test suite
 python tests/test_model.py
 ```
 
@@ -44,122 +47,164 @@ python tests/test_model.py
 
 ```
 or-surgery-scheduling/
-├── main.py                       # CLI entry point
-├── FORMULATION.md                # Full mathematical formulation (sets, params, variables, constraints, objective)
+├── main.py                       # CLI entry point + benchmark mode
+├── FORMULATION.md                # Baseline MILP: sets, params, variables, objective, constraints
+├── PRODUCTION_FORMULATION.md     # Interval-based CP-SAT: maps onto the baseline, adds exact timing
+├── RESULTS.md                    # Demo-vs-medium benchmark numbers + trade-off analysis
 ├── README.md                     # This file
 ├── requirements.txt
 │
 ├── src/
 │   ├── model/
 │   │   ├── types.py              # SurgicalCase, Surgeon, OperatingRoom, PlanningInstance, SolverResult
-│   │   └── penalty.py            # w_c penalty weight (Figure 5.1, Marques & Captivo 2015)
+│   │   └── penalty.py            # w_c non-scheduling penalty weight
 │   │
 │   ├── solvers/
-│   │   ├── base_solver.py        # Abstract interface — solver-agnostic
-│   │   ├── pulp_cbc_solver.py    # PuLP + CBC — PRIMARY demo solver
-│   │   ├── pyomo_solver.py       # Pyomo — CBC / GLPK / Gurobi / CPLEX / HiGHS
-│   │   └── greedy_solver.py      # Constructive heuristic (warm-start / upper bound)
+│   │   ├── base_solver.py            # Abstract interface — solver-agnostic
+│   │   ├── milp_baseline_solver.py   # OR-Tools MPSolver (CBC/SCIP) + native gurobipy — BASELINE
+│   │   ├── cp_sat_interval_solver.py # OR-Tools CP-SAT, interval-based — PRODUCTION
+│   │   ├── hexaly_solver.py          # Hexaly local-search backend (graceful fallback)
+│   │   └── greedy_solver.py          # Constructive heuristic (warm-start / sanity bound)
 │   │
 │   ├── data/
-│   │   └── instances.py          # demo_chln() · small_chln() · literature_cardoen()
+│   │   └── instances.py          # demo_instance() · medium_instance()
 │   │
 │   └── utils/
-│       └── reporter.py           # Schedule printer + consistency checks
+│       ├── reporter.py           # Schedule printer + constraint consistency checks
+│       └── visualizer.py         # Gantt-style PNG export (--plot)
 │
 ├── tests/
-│   └── test_model.py             # 7 unit tests — all constraint types
+│   └── test_model.py             # Cross-solver acceptance tests (MILP + CP-SAT)
 │
 └── docs/
-    └── or_surgery_scheduling_beamer.pptx   # 20-slide Beamer-style presentation
+    ├── img/                      # Generated schedule plots (see "Visual Schedule" below)
+    └── or_surgery_scheduling_beamer.pptx
 ```
 
 ---
 
-## Mathematical Model — Summary
+## The Model, in Brief
 
-**Decision variables:**
+**Sets:** cases $C$, days $D$ (one week), rooms $R$, surgeons $H$, shared equipment $E$.
 
-| Variable | Domain | Meaning |
-|----------|--------|---------|
-| $x_{cdbr}$ | $\{0,1\}$ | Case $c$ scheduled on day $d$, block $b$, room $r$ |
-| $z_c$ | $\mathbb{R}^+ (\in\{0,1\})$ | Case $c$ is NOT scheduled (penalty variable) |
+**Baseline decision variables:** $x_{cdr}\in\{0,1\}$ (case $c$ in room $r$ on day $d$),
+$z_c\ge 0$ (case $c$ left unscheduled this week).
 
-**Objective (5.12):** minimise weighted tardiness + non-scheduling penalty.  
-Three terms: on-time cases / overdue cases (×α urgency multiplier) / penalty w_c for non-scheduling.
+**Objective:** minimize a three-term weighted tardiness — prefer scheduling
+high-priority, close-to-deadline cases earlier; penalize overdue cases more steeply the
+later they're deferred; pay a dominant penalty only when a case truly cannot be fit in.
 
-**Constraints:**
+**Constraints (baseline):** one case per patient/week, priority-4 cases locked to day 1,
+schedule-or-penalize for everyone else, room-service eligibility, ambulatory/pediatric
+carve-outs, room capacity, surgeon daily/weekly limits, shared-equipment day cap.
 
-| # | Name | Rule |
-|---|------|------|
-| 5.1 | One per patient | At most one surgery per patient per week |
-| 5.2 | Priority-4 on Monday | Deferred-urgent cases must be on day 1 (72h SIGIC window) |
-| 5.3 | Schedule or penalise | Non-urgent cases: scheduled exactly once, or pay w_c |
-| 5.4 | MSS service-room | Rooms only host cases from their assigned surgical service |
-| 5.5 | Ambulatory block | Ambulatory-only rooms exclude inpatient cases |
-| 5.6 | ORL paediatric Fri | ORL rooms on Fridays: patients ≤ 8 years only |
-| 5.7 | Room capacity | Total occupation ≤ daily opening hours (no overtime) |
-| 5.8 | Surgeon daily | Operative time per surgeon per day ≤ k_{hd}^dia |
-| 5.9 | Surgeon weekly | Operative time per surgeon per week ≤ k_h^sem |
+**Production upgrade (CP-SAT, interval-based):** the same model, with exact start times
+per case, `AddNoOverlap` replacing aggregate room/surgeon sums, `AddCumulative` replacing
+the day-count equipment cap with real concurrency, and a downstream recovery/ICU-bed
+`AddCumulative` that the baseline deliberately excludes (see FORMULATION.md §8).
 
-See **FORMULATION.md** for full notation, justifications, and references.
+Full math, assumptions, and what's deliberately left out: **FORMULATION.md** /
+**PRODUCTION_FORMULATION.md**.
 
 ---
 
-## Demo Results (20-case CHLN instance)
+## Results — Baseline vs. Production Trade-off
 
-```
-========================================================================
-  ELECTIVE SURGERY SCHEDULING — DEMO_CHLN_20CASES
-========================================================================
-  Cases    : 20  |  Rooms: 5  |  Surgeons: 6
-  Overdue  : 3 cases already past deadline
-  P4 (must Mon): 3 cases
+Full discussion and methodology in **[RESULTS.md](RESULTS.md)**. Summary:
 
-  Solver  : PuLP/CBC
-  Status  : Optimal
-  Obj     : 155.00
-  Time    : 0.027s
+### Demo instance (20 cases, 5 rooms, 6 surgeons)
 
-  Mon  (11 cases): C14 C18 [CVA] | C03⚠ C04 C07 C02 C05★ C06 [ORL] | C11⚠ C13★ [ORT]
-  Tue  ( 6 cases): C16⚠ C15 C17  [CVA] | C01 [ORL] | C09 C10 [ORT]
-  Wed  ( 2 cases): C20 [CVA] | C08 [ORT]
-  Thu  ( 1 case ): C12 [ORT]
-  Fri  ( 0 cases): — (ORL paediatric circuit: no adult ORL patients ✓)
+| Solver | Status | Objective | Gap | Scheduled | Time |
+|---|---|---|---|---|---|
+| Greedy | Feasible | 163.0 | — | 20/20 | 0.000s |
+| OR-Tools/CBC | Optimal | 157.0 | 0.00% | 20/20 | 0.028s |
+| Gurobi | Optimal | 157.0 | 0.00% | 20/20 | 0.186s |
+| **CP-SAT/Interval** | **Optimal** | **155.0** | 0.00% | 20/20 | 0.084s |
+| Hexaly (→ CBC fallback*) | Optimal | 157.0 | 0.00% | 20/20 | 0.021s |
 
-  ⚠ = overdue   ★ = Priority-4 (forced to Mon)   Unscheduled: 0
+### Medium instance (200 cases, 12 rooms, 17 surgeons, 60s time limit)
 
-  ✓ All priority-4 cases scheduled on Monday
-  ✓ Paediatric ORL circuit respected
-  ✓ All room capacities respected (no overtime)
-  ✓ All surgeon time limits respected
-```
+| Solver | Status | Objective | Gap | Scheduled | Time |
+|---|---|---|---|---|---|
+| Greedy | Feasible | 70,883.0 | — | 124/200 | 0.002s |
+| OR-Tools/CBC | Feasible (time-out) | 44,606.0 | 0.90% | 128/200 | 60.085s |
+| **Gurobi** | **Optimal** | **44,232.0** | 0.80%† | 129/200 | **0.708s** |
+| CP-SAT/Interval | Feasible (time-out) | **40,799.0** | 2.42% | 131/200 | 60.403s |
+| Hexaly (→ CBC fallback*) | Feasible (time-out) | 44,606.0 | 0.90% | 128/200 | 60.097s |
 
-**Solver comparison (demo instance):**
+\* No Hexaly license in this environment — reports the CBC baseline's result, not its
+own; see RESULTS.md for the qualitative expectation with a real license.
+† Gurobi's `Optimal` means "within the configured 1% relative-gap tolerance" — its
+actual default termination rule, not literally a zero gap.
 
-| Solver       | Status  | Obj   | Scheduled | Time     |
-|--------------|---------|-------|-----------|----------|
-| Greedy       | Feasible| 161.0 | 20/20     | < 0.001s |
-| PuLP/CBC     | Optimal | 155.0 | 20/20     | 0.027s   |
-| Pyomo/CBC    | Optimal | 155.0 | 20/20     | 0.046s   |
-| Pyomo/Gurobi | Optimal | 155.0 | 20/20     | < 0.01s  |
+**What this shows:**
 
-Greedy gap: **3.7%** — useful as warm-start for MILP.
+1. **Gurobi vs. CBC, identical formulation:** 0.7s vs. a 60-second time-out on 200
+   cases. Same code path, only the backend differs — the standard argument for a
+   commercial MILP license once an instance crosses a few hundred binary variables.
+2. **CP-SAT finds a *better* objective than both exact MILP solvers, on both
+   instances** — not from out-searching them, but from modeling the shared-equipment
+   constraint exactly (`AddCumulative`, real time overlap) instead of as a same-day
+   headcount cap. On the demo instance this is visible directly in the schedule: CP-SAT
+   places two different C-arm cases on the same day, in different rooms, at
+   non-overlapping times — a placement the baseline's day-count cap forbids outright
+   even though it's perfectly legitimate. On the medium instance this effect is ~8% of
+   the objective.
+3. **Practical read:** ship OR-Tools/CBC as the free, always-available correctness
+   baseline; move production traffic to CP-SAT once instance size makes the
+   day-bucket equipment/room approximation costly (it visibly is, above); add Gurobi
+   when a hospital needs a *proven* optimum at full scale; evaluate Hexaly for the
+   multi-week / real-time-disruption regime once a license is available.
 
 ---
 
-## Solver Backends
+## Visual Schedule (Gantt-style)
 
-| Solver | Licence | Installation | Notes |
-|--------|---------|-------------|-------|
-| PuLP/CBC | Free (EPL) | `pip install pulp` | Default; always available |
-| Pyomo/CBC | Free (EPL) | `pip install pyomo` + `apt install coinor-cbc` | Same model, Pyomo interface |
-| Pyomo/GLPK | Free (GPL) | `apt install glpk-utils` | Good for small/medium instances |
-| Pyomo/Gurobi | Commercial | `pip install gurobipy` + licence | Best performance at scale |
-| Pyomo/CPLEX | Commercial | `pip install cplex` + licence | IBM; competitive with Gurobi |
-| Pyomo/HiGHS | Free (MIT) | `pip install highspy` | State-of-the-art open solver |
-| Greedy | None | built-in | Priority-first heuristic; 3.7% gap on demo |
+Per the case prompt: "a plain terminal output or a simple image of the schedule is
+plenty." Generated with `python main.py --instance <name> --solver <name> --plot
+out.png` (see `src/utils/visualizer.py`). Each bar is one case; outlined bars are
+priority-4 (locked to day 1); colors are surgical service.
 
-For very large instances (real CHLN: ~130k variables after pre-filtering), Gurobi or CPLEX with the Pyomo backend are recommended. HiGHS is a strong free alternative.
+**Demo instance, baseline MILP** — note cases within a room-day are laid out
+back-to-back in an arbitrary order, because the baseline itself makes no claim about
+intra-day sequencing (see FORMULATION.md §3):
+
+![Demo instance, OR-Tools/CBC baseline](docs/img/demo_baseline_milp.png)
+
+**Demo instance, CP-SAT production model** — same cases, but with real start/end
+clock times and, on Tuesday, two different C-arm cases placed in different rooms at
+non-overlapping times (the schedule the baseline's day-count equipment cap forbids —
+see RESULTS.md):
+
+![Demo instance, CP-SAT interval-based](docs/img/demo_cp_sat.png)
+
+**Medium instance (200 cases), CP-SAT production model** — the scaling instance, with
+exact per-case start times across all 12 rooms:
+
+![Medium instance, CP-SAT interval-based](docs/img/medium_cp_sat.png)
+
+(This image's objective may differ slightly run-to-run from the RESULTS.md table —
+CP-SAT's multi-worker parallel search is an anytime method, so two 60-second runs of
+the same model can return different, both-valid, feasible solutions. That run-to-run
+variance is expected behavior for parallel portfolio search, not a bug.)
+
+---
+
+## Testing Against Real Data
+
+Both instances above are synthetic (literature-structured — see FORMULATION.md §9).
+For testing at real scale, two CC BY-4.0 hospital OR-log datasets are a direct fit:
+
+- Akbarzadeh & Maenhout (2023). *Real life data for operating room scheduling problem*
+  (Ghent University Hospital, May 2017). Mendeley Data.
+  https://data.mendeley.com/datasets/n2v49z2vnp/2
+- Akbarzadeh & Maenhout (2023). *RealLife operating room scheduling dataset,
+  2021-Jan-May* — 20 weekly instances, 8 demand/flexibility configurations. Mendeley
+  Data. https://data.mendeley.com/datasets/c8d342266x/1
+
+See RESULTS.md for how their schema maps onto `PlanningInstance` (no formulation
+changes needed, just a loader — intentionally not built here, per the brief's own
+"small demo" framing).
 
 ---
 
@@ -167,31 +212,34 @@ For very large instances (real CHLN: ~130k variables after pre-filtering), Gurob
 
 ### 1. Passing the Torch
 
-To hand this formulation to a developer faithfully:
-
-1. **This markdown + code**: `FORMULATION.md` and `src/` are designed to be read together — every constraint in the markdown has an identically-numbered counterpart in the Python (`C57_RoomCapacity`, `C58_SurgeonDaily`, etc.).
-2. **Entity schema**: `src/model/types.py` is the data dictionary — `SurgicalCase`, `Surgeon`, `OperatingRoom`, `PlanningInstance` are the schema, no ORM needed.
-3. **Acceptance tests**: `tests/test_model.py` has 7 constraint-level unit tests. Any correct implementation must pass all 7. The tests are the contract.
-4. **Minimum reproducible instance**: `demo_chln()`, 20 cases, known optimal obj = 155.0 in < 0.03s. Run this before scaling.
-5. **Domain glossary**: LIC (Lista de Inscritos para Cirurgia), MSS (Master Surgery Schedule), SIGIC, prioridade, âmbito, higienização — shared vocabulary between OR scientists and engineers.
+I'd hand a developer four things: **(1)** FORMULATION.md/PRODUCTION_FORMULATION.md
+alongside `src/model/types.py` — the dataclasses are the data dictionary, one source of
+truth. **(2)** the solver code itself, where every constraint is labeled (C1…C10) and the
+matching code carries the same label, so reading them side by side leaves no ambiguity.
+**(3)** `tests/test_model.py` as the acceptance contract — any reimplementation must
+pass the same hard-constraint checks on the same demo instance. **(4)** a short glossary
+of the handful of domain terms that aren't self-explanatory (room roster, ambulatory,
+priority tiers) — most miscommunication on these projects is vocabulary, not math.
 
 ### 2. A Library of Models
 
-Organise the library around four layers:
-
-1. **Core abstractions** (`BaseSolver`, `PlanningInstance`, typed dataclasses) — solver-agnostic, fully testable, no external dependencies.
-2. **Domain building blocks** (`CapacityConstraint`, `ResourceLimitConstraint`, `PriorityWeighting`, `TimeWindowConstraint`) — reusable primitives composable across surgery scheduling, nurse rostering, bed allocation, equipment assignment.
-3. **Problem templates** (`SurgeryScheduler`, `NurseRoster`, `BedAllocation`) — YAML/JSON-configured compositions of building blocks; adding a new problem means assembling blocks and writing a config file, not writing new Python.
-4. **Institution configurations** (`CHLN_Config`, `HospitalX_Config`) — client-specific overrides (MSS structure, SIGIC parameters, special operational rules).
-
-The solver layer is orthogonal to all four: the same `ConcreteModel` compiles to CBC, Gurobi, CPLEX, or HiGHS via a single string argument, so licence availability and instance scale drive backend selection without touching the formulation.
+Four layers, solver-agnostic except the bottom one. First, core data abstractions —
+typed dataclasses, no solver imports — that any model is built on top of. Second,
+reusable constraint *patterns* (capacity-sum, no-double-booking via NoOverlap,
+tiered-priority tardiness objective, eligibility pre-filter) that recur across
+scheduling problems, since nurse rostering and bed allocation need the same shapes, not
+the same model. Third, problem templates that compose those patterns — this repo's
+baseline and production models are two such templates. Fourth, a thin solver-adapter
+layer, one file per backend family (MILP, CP, local search), so a new problem picks a
+backend without rewriting how its constraints are expressed. The
+baseline/production/Hexaly trade-off this repo demonstrates is itself a template for
+that last layer: profile the instance sizes you'll actually see, then pick the cheapest
+model that meets the latency/quality bar at that scale.
 
 ---
 
 ## References
 
-1. Marques, I., & Captivo, M.E. (2015). *Planeamento de cirurgias eletivas no Centro Hospitalar Lisboa Norte*. MSc Thesis, Universidade de Lisboa.
-2. Cardoen, B., Demeulemeester, E., & Beliën, J. (2010). Operating room planning and scheduling: A literature review. *EJOR* 201(3), 921–932.
-3. Denton, B.T., et al. (2010). Optimal allocation of surgery blocks to operating rooms under uncertainty. *Operations Research* 58(4), 802–816.
-4. SIGIC — Portaria n.º 45/2008, Diário da República, Portugal.
-5. Van Riet, C., & Demeulemeester, E. (2015). Trade-offs in OR planning for electives and emergencies. *OR Spectrum* 37(1), 59–87.
+See **FORMULATION.md §12** and **PRODUCTION_FORMULATION.md §8** for the full citation
+list (Cardoen et al. 2010; Marques & Captivo 2015; Denton et al. 2010; SIGIC; Akbarzadeh
+& Maenhout 2023 real-data sources; OR-Tools CP-SAT documentation).

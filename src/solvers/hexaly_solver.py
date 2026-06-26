@@ -1,49 +1,47 @@
 """
-hexaly_solver.py — Hexaly (formerly LocalSolver) backend.
+hexaly_solver.py — Hexaly backend (set-partition formulation of the
+baseline model).
 
-What is Hexaly?
----------------
-Hexaly (https://www.hexaly.com) is a commercial black-box optimisation engine
-that combines mathematical programming, constraint programming, and local search.
-It handles mixed-integer programmes natively but excels on large combinatorial
-problems where MILP solvers struggle with branch-and-bound.
+What is Hexaly, and why include it?
+------------------------------------
+Hexaly (https://www.hexaly.com, formerly LocalSolver) is a commercial
+optimisation engine combining mathematical programming with a local-search
+core. For combinatorial assignment problems like this one, it is often
+able to produce strong feasible solutions on large instances faster than
+branch-and-bound MILP, at the cost of not proving optimality the way CBC/
+Gurobi/CP-SAT can on small-to-medium instances. We include it here as the
+third point in the trade-off triangle this repo is built to demonstrate:
 
-Why consider Hexaly for this problem?
---------------------------------------
-At real CHLN scale (~130,000 binary variables after pre-filtering), Gurobi and
-CPLEX reach near-optimal solutions in < 5 minutes.  But for a rolling-horizon
-multi-week extension, or when ICU/bed downstream constraints are added, the
-search space grows significantly.  Hexaly's local-search backbone can provide
-good feasible solutions in seconds, then improve them gradually — making it
-suitable for real-time rescheduling (intra-day disruptions).
+    OR-Tools MILP (CBC/Gurobi)  — exact, baseline, day-granularity
+    OR-Tools CP-SAT (interval)  — exact, production, time-granularity
+    Hexaly (local search)       — anytime, scales past exact-method limits
 
-Reference: Hexaly technical documentation; Vanhoucke et al. (2007) comparison
-of MIP vs local search for OR scheduling.
+See RESULTS.md for where each one wins on the demo vs. medium instance.
 
-Installation
-------------
-    pip install hexaly   # requires a Hexaly licence key
-    export LS_LICENSE_PATH=/path/to/licence
+Installation / academic licence
+--------------------------------
+    pip install hexaly
+    # then register for a (free) academic licence at https://www.hexaly.com/
+    # and either drop the licence file where Hexaly expects it, or:
+    export HEXALY_LICENSE=/path/to/license.dat        (Linux/Mac)
+    $env:HEXALY_LICENSE = "C:\\path\\to\\license.dat"  (PowerShell)
 
-Usage
+No licence is installed in the environment this repo was built in — the
+class below is written against the real Hexaly API (not a placeholder),
+but falls back to the OR-Tools MILP baseline with a clear message if the
+package or licence is unavailable, so the rest of the demo keeps working.
+
+Model
 -----
-    python main.py --solver hexaly
-
-Model translation
------------------
-The MILP model (x_{cdbr} binary, linear constraints) maps naturally to Hexaly's
-set-based modelling:
-  - Decision: a set S_r ⊆ C for each room r on each day (cases assigned to r,d).
-  - Constraints: |S_r| bounded by room capacity sum; disjoint across rooms/days.
-  - Objective: same weighted tardiness formula.
-
-The set-partition formulation is more natural for Hexaly than the flat binary
-x_{cdbr} encoding, and avoids the large sparse coefficient matrix that can slow
-MILP solvers on infeasible sub-trees.
+Decision: for every (day d, room r), a set S_{dr} subseteq C of the cases
+assigned to that slot — Hexaly's set-based modelling is a more natural fit
+for this "bin assignment" shape than the flat binary x_{cdr} encoding, and
+keeps the formulation's spirit (FORMULATION.md) without a sparse big
+coefficient matrix.
 """
 
 from __future__ import annotations
-from typing import Optional
+from typing import Dict, Tuple
 
 from ..model.types import PlanningInstance, SolverResult, Assignment, Priority
 from ..model.penalty import compute_all_penalties
@@ -52,182 +50,183 @@ from .base_solver import BaseSolver
 
 class HexalySolver(BaseSolver):
     """
-    Hexaly backend for large-instance surgery scheduling.
-
-    Falls back gracefully to PuLP/CBC if hexaly is not installed,
-    so the codebase runs correctly in environments without a Hexaly licence.
+    Hexaly backend. Falls back to the OR-Tools MILP baseline if `hexaly`
+    is not importable or no licence is configured, so the codebase keeps
+    running end to end in environments without a Hexaly licence.
     """
 
     name = "Hexaly"
 
     def _build_and_solve(self, instance: PlanningInstance) -> SolverResult:
         try:
-            import hexaly.optimizer as hx
+            import hexaly.optimizer as hxopt
         except ImportError:
-            return self._fallback(instance)
+            return self._fallback(instance, reason="package 'hexaly' not installed")
 
-        return self._solve_with_hexaly(instance, hx)
+        try:
+            return self._solve_with_hexaly(instance, hxopt)
+        except Exception as exc:
+            # Typically a licence error (e.g. no HEXALY_LICENSE configured).
+            return self._fallback(instance, reason=f"{type(exc).__name__}: {exc}")
 
-    def _solve_with_hexaly(self, instance, hx) -> SolverResult:
-        """
-        Hexaly set-partition formulation.
+    def _solve_with_hexaly(self, instance: PlanningInstance, hxopt) -> SolverResult:
+        with hxopt.HexalyOptimizer() as optimizer:
+            m = optimizer.model
 
-        Variables
-        ---------
-        For each (day d, room r): a set S_{dr} ⊆ C of cases assigned to that slot.
+            cases = instance.cases
+            rooms = instance.rooms
+            days = instance.days
+            case_map = instance.cases_by_id
+            surg_map = instance.surgeons_by_id
+            penalties = compute_all_penalties(instance)
+            alpha = instance.alpha
 
-        Constraints
-        -----------
-        1. Disjoint cover: each case appears in at most one S_{dr}.
-        2. Priority-4: case c must be in some S_{d1, r} (Monday).
-        3. Room capacity: sum_{c ∈ S_{dr}} t_c^tot ≤ k_{dbr}.
-        4. Surgeon daily/weekly: sum over cases in surgeon h's sets.
-        5. Service assignment: only cases with s_c = service(r) in S_{dr}.
+            n_cases = len(cases)
+            case_idx = {c.id: i for i, c in enumerate(cases)}
 
-        Objective
-        ---------
-        Same three-term formula as the MILP, evaluated on the assignment.
-        """
-        optimizer = hx.HexalyOptimizer()
-        m = optimizer.model
-
-        cases    = instance.cases
-        rooms    = instance.rooms
-        days     = instance.days
-        case_map = instance.cases_by_id
-        surg_map = instance.surgeons_by_id
-        penalties = compute_all_penalties(cases)
-        alpha    = instance.alpha
-        day_index = {d: i+1 for i, d in enumerate(days)}
-
-        n_cases = len(cases)
-        case_idx = {c.id: i for i, c in enumerate(cases)}
-
-        # ── Variables: sets of case indices ───────────────────────────
-        # S[d][r_idx] = set of case indices assigned to (day d, room r)
-        S = {}
-        for d_idx, d in enumerate(days):
-            for r_idx, r in enumerate(rooms):
-                S[d_idx, r_idx] = m.set(n_cases)
-
-        # ── Constraint: each case in at most one slot ──────────────────
-        # (Also implements service-room assignment: add only eligible cases)
-        for d_idx, d in enumerate(days):
-            for r_idx, r in enumerate(rooms):
-                eligible = [
-                    case_idx[c.id] for c in cases
-                    if instance.room_service_match(r, c, d)
-                    and not (r.ambulatory_only and c.scope.value != 2)
-                    and not instance.is_paediatric_day(c, d)
-                    and surg_map[c.surgeon_id].availability.get(d, True)
-                    and (not c.must_schedule_day1 or d == days[0])
-                ]
-                m.constraint(m.is_subset(S[d_idx, r_idx], m.set_of(eligible)))
-
-        # Partition: case appears in at most one set
-        all_sets = [S[k] for k in S]
-        m.constraint(m.partition(*all_sets))
-
-        # ── Constraint: room capacity ──────────────────────────────────
-        t_tot_array = m.array([c.t_tot for c in cases])
-        for d_idx, d in enumerate(days):
-            for r_idx, r in enumerate(rooms):
-                cap = r.capacity_min.get(d, 0)
-                load = m.sum(S[d_idx, r_idx], lambda i: t_tot_array[i])
-                m.constraint(load <= cap)
-
-        # ── Constraint: priority-4 on day 1 ───────────────────────────
-        d1_idx = 0
-        for c in cases:
-            if c.must_schedule_day1:
-                ci = case_idx[c.id]
-                in_d1 = m.or_(*[m.contains(S[d1_idx, r_idx], ci) for r_idx in range(len(rooms))])
-                m.constraint(in_d1)
-
-        # ── Constraint: surgeon limits ────────────────────────────────
-        t_cir_array = m.array([c.t_cir for c in cases])
-        surg_idx_map = {s.id: [case_idx[c.id] for c in cases if c.surgeon_id == s.id]
-                        for s in instance.surgeons}
-
-        for s in instance.surgeons:
-            sc_indices = surg_idx_map[s.id]
-            if not sc_indices:
-                continue
-            surg_set = m.set_of(sc_indices)
-            # Weekly
-            total_cir = m.sum(
-                [m.sum(m.and_(S[d_idx, r_idx], surg_set), lambda i: t_cir_array[i])
-                 for d_idx, d in enumerate(days)
-                 for r_idx in range(len(rooms))]
-            )
-            m.constraint(total_cir <= s.weekly_limit_min)
-            # Daily
+            # ── Variables: S[d,r] = set of case indices in that slot ──────
+            S = {}
             for d_idx, d in enumerate(days):
-                if not s.availability.get(d, True):
-                    continue
-                day_cir = m.sum(
-                    [m.sum(m.and_(S[d_idx, r_idx], surg_set), lambda i: t_cir_array[i])
-                     for r_idx in range(len(rooms))]
-                )
-                m.constraint(day_cir <= s.daily_limit_min)
+                for r_idx, r in enumerate(rooms):
+                    S[d_idx, r_idx] = m.set(n_cases)
 
-        # ── Objective ─────────────────────────────────────────────────
-        obj_terms = []
-        for d_idx, d in enumerate(days):
-            d_val = day_index[d]
-            for r_idx in range(len(rooms)):
-                for c in cases:
+            # ── Eligibility per slot (mirrors the baseline's feasible set) ─
+            eligible_idx: Dict[Tuple[int, int], list] = {}
+            for d_idx, d in enumerate(days):
+                for r_idx, r in enumerate(rooms):
+                    elig = [
+                        case_idx[c.id] for c in cases
+                        if instance.room_service_match(r, c, d)
+                        and not (r.ambulatory_only and c.scope.value != 2)
+                        and not instance.violates_pediatric_block(c, d)
+                        and surg_map[c.surgeon_id].availability.get(d, True)
+                        and (not c.must_schedule_day1 or d == days[0])
+                    ]
+                    eligible_idx[d_idx, r_idx] = elig
+                    m.constraint(m.is_subset(S[d_idx, r_idx], m.set_of(*elig) if elig else m.set_of()))
+
+            # ── Partition: each case appears in at most one slot ──────────
+            all_sets = list(S.values())
+            m.constraint(m.disjoint(*all_sets) if hasattr(m, "disjoint")
+                         else m.partition(*all_sets))
+
+            # ── C7: room capacity ─────────────────────────────────────────
+            t_tot_array = m.array([c.t_tot for c in cases])
+            for d_idx, d in enumerate(days):
+                for r_idx, r in enumerate(rooms):
+                    cap = r.capacity_min.get(d, 0)
+                    load = m.sum(S[d_idx, r_idx], lambda i: t_tot_array[i])
+                    m.constraint(load <= cap)
+
+            # ── C2: priority EMERGENT_ADDON must be in some Monday slot ───
+            d1_idx = 0
+            for c in cases:
+                if c.must_schedule_day1:
                     ci = case_idx[c.id]
-                    dtd = c.days_to_deadline
-                    coeff = (dtd + d_val) if dtd >= 0 else (dtd + alpha * d_val)
-                    in_slot = m.contains(S[d_idx, r_idx], ci)
-                    obj_terms.append(coeff * in_slot)
+                    in_d1 = m.or_(*[m.contains(S[d1_idx, r_idx], ci)
+                                    for r_idx in range(len(rooms))])
+                    m.constraint(in_d1)
 
-        # Penalty term
-        scheduled_mask = m.or_(*[m.contains(S[k], case_idx[c.id]) for k in S])
-        for c in cases:
-            if c.priority != Priority.DEFERRED_URGENT:
-                ci = case_idx[c.id]
-                not_scheduled = m.not_(m.or_(*[m.contains(S[k], ci) for k in S]))
-                obj_terms.append(c.priority * penalties[c.id] * not_scheduled)
+            # ── C8/C9: surgeon daily + weekly limits ───────────────────────
+            t_cir_array = m.array([c.t_cir for c in cases])
+            for s in instance.surgeons:
+                sc_indices = [case_idx[c.id] for c in cases if c.surgeon_id == s.id]
+                if not sc_indices:
+                    continue
+                surg_set = m.set_of(*sc_indices)
 
-        m.minimize(m.sum(obj_terms))
-        m.close()
+                total_cir = m.sum(
+                    m.sum(m.and_(S[d_idx, r_idx], surg_set), lambda i: t_cir_array[i])
+                    for d_idx in range(len(days)) for r_idx in range(len(rooms))
+                )
+                m.constraint(total_cir <= s.weekly_limit_min)
 
-        optimizer.param.time_limit = self.time_limit_sec
-        optimizer.solve()
+                for d_idx, d in enumerate(days):
+                    if not s.availability.get(d, True):
+                        continue
+                    day_cir = m.sum(
+                        m.sum(m.and_(S[d_idx, r_idx], surg_set), lambda i: t_cir_array[i])
+                        for r_idx in range(len(rooms))
+                    )
+                    m.constraint(day_cir <= s.daily_limit_min)
 
-        # Extract solution
-        assignments = []
-        scheduled_ids = set()
-        for d_idx, d in enumerate(days):
-            for r_idx, r in enumerate(rooms):
-                for ci in S[d_idx, r_idx].value:
-                    cid = cases[ci].id
-                    assignments.append(Assignment(case_id=cid, day=d, room_id=r.id))
-                    scheduled_ids.add(cid)
+            # ── C10: shared equipment, day-level aggregate (as baseline) ──
+            if instance.has_equipment_limits():
+                equip_ids = {e for (e, _d) in instance.equipment_capacity}
+                for e in equip_ids:
+                    equip_indices = [case_idx[c.id] for c in cases if c.equipment == e]
+                    if not equip_indices:
+                        continue
+                    equip_set = m.set_of(*equip_indices)
+                    for d_idx, d in enumerate(days):
+                        cap = instance.equipment_capacity.get((e, d))
+                        if cap is None:
+                            continue
+                        count = m.sum(
+                            m.count(m.and_(S[d_idx, r_idx], equip_set))
+                            for r_idx in range(len(rooms))
+                        )
+                        m.constraint(count <= cap)
 
-        unscheduled = [c.id for c in cases if c.id not in scheduled_ids
-                       and c.priority != Priority.DEFERRED_URGENT]
+            # ── Objective: same three-term formula ─────────────────────────
+            day_index = {d: i + 1 for i, d in enumerate(days)}
+            obj_terms = []
+            for d_idx, d in enumerate(days):
+                d_val = day_index[d]
+                for r_idx in range(len(rooms)):
+                    for c in cases:
+                        ci = case_idx[c.id]
+                        dtd = instance.days_to_deadline(c)
+                        coeff = (dtd + d_val) if dtd >= 0 else (dtd + alpha * d_val)
+                        obj_terms.append(coeff * m.contains(S[d_idx, r_idx], ci))
 
-        obj_val = float(optimizer.solution.objective_value)
+            scheduled_indicator = {}
+            for c in cases:
+                if c.priority != Priority.EMERGENT_ADDON:
+                    ci = case_idx[c.id]
+                    any_slot = m.or_(*[m.contains(S[k], ci) for k in S])
+                    not_scheduled = m.not_(any_slot)
+                    scheduled_indicator[c.id] = not_scheduled
+                    obj_terms.append(c.priority.value * penalties[c.id] * not_scheduled)
 
-        return SolverResult(
-            status="Feasible",
-            objective_value=obj_val,
-            assignments=assignments,
-            unscheduled_case_ids=unscheduled,
-            solve_time_sec=0.0,
-            solver_name=self.name,
-        )
+            m.minimize(m.sum(obj_terms))
+            m.close()
 
-    def _fallback(self, instance: PlanningInstance) -> SolverResult:
-        """Graceful fallback when Hexaly is not installed."""
+            optimizer.param.time_limit = self.time_limit_sec
+            optimizer.solve()
+
+            assignments, scheduled_ids = [], set()
+            for d_idx, d in enumerate(days):
+                for r_idx, r in enumerate(rooms):
+                    for ci in S[d_idx, r_idx].value:
+                        cid = cases[ci].id
+                        assignments.append(Assignment(case_id=cid, day=d, room_id=r.id))
+                        scheduled_ids.add(cid)
+
+            unscheduled = [c.id for c in cases
+                           if c.id not in scheduled_ids and c.priority != Priority.EMERGENT_ADDON]
+
+            obj_val = float(optimizer.solution.objective_value)
+
+            return SolverResult(
+                status="Feasible",
+                objective_value=obj_val,
+                assignments=assignments,
+                unscheduled_case_ids=unscheduled,
+                solve_time_sec=0.0,
+                solver_name=self.name,
+            )
+
+    def _fallback(self, instance: PlanningInstance, reason: str) -> SolverResult:
         print(
-            "  [HexalySolver] hexaly not installed (pip install hexaly + licence).\n"
-            "  Falling back to PuLP/CBC."
+            f"  [HexalySolver] unavailable ({reason}).\n"
+            f"  Install with `pip install hexaly` and configure an academic\n"
+            f"  licence (see module docstring) to run this backend for real.\n"
+            f"  Falling back to the OR-Tools/CBC baseline."
         )
-        from .pulp_cbc_solver import PuLPCBCSolver
-        fallback = PuLPCBCSolver(time_limit_sec=self.time_limit_sec, mip_gap=self.mip_gap)
-        fallback.name = "Hexaly→PuLP/CBC (fallback)"
-        return fallback._build_and_solve(instance)
+        from .milp_baseline_solver import MILPBaselineSolver
+        fallback = MILPBaselineSolver(backend="CBC", time_limit_sec=self.time_limit_sec,
+                                       mip_gap=self.mip_gap)
+        result = fallback._build_and_solve(instance)
+        result.solver_name = "Hexaly -> OR-Tools/CBC (fallback)"
+        return result

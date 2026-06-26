@@ -1,11 +1,17 @@
-# Core optimisation libraries (no commercial licence required)
-pulp>=2.7
-pyomo>=6.7
+# Core: OR-Tools provides both the MILP baseline (linear_solver, with CBC
+# and SCIP bundled in the wheel — no external solver binary needed) and the
+# interval-based CP-SAT production model (sat.python.cp_model).
+ortools>=9.9
 
-# Optional commercial solvers (install separately)
-# gurobipy     # Gurobi — best performance, requires licence
-# cplex        # IBM CPLEX — requires licence
-# highspy      # HiGHS — free, state-of-the-art open solver
+# Core: Gantt-style schedule plot (--plot flag). The case prompt explicitly
+# allows "a simple image of the schedule" in lieu of a front end.
+matplotlib>=3.8
 
-# Utilities
-dataclasses; python_version < "3.7"
+# Optional: commercial backend for the baseline MILP (best performance at
+# scale). Requires a Gurobi licence; OR-Tools' MPSolver drives it directly.
+# gurobipy
+
+# Optional: Hexaly local-search/hybrid backend (third point of the
+# trade-off comparison). Requires an academic licence — see
+# src/solvers/hexaly_solver.py for setup instructions.
+# hexaly

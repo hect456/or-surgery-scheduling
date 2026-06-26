@@ -1,299 +1,346 @@
-# Elective Surgery Scheduling — MILP Formulation
+# Elective Surgery Scheduling — Baseline MILP Formulation
 
-**Author:** Operations Research Scientist  
-**Context:** Real-world OR scheduling problem at a Portuguese NHS hospital (SNS).  
-**Reference:** Marques & Captivo (2015), *Centro Hospitalar Lisboa Norte (CHLN)*; Cardoen et al. (2010) benchmark.
+This document is the baseline (advance-scheduling, day-granularity) formulation. A
+second, production-grade **interval-based Constraint Programming** model that extends
+this one is in [PRODUCTION_FORMULATION.md](PRODUCTION_FORMULATION.md). Benchmark
+numbers and the baseline-vs-production trade-off are in [RESULTS.md](RESULTS.md).
 
 ---
 
 ## 1. Problem Statement
 
-A large hospital group needs to schedule **elective surgical cases** (from the *Lista de Inscritos para Cirurgia*, LIC) across a **one-week planning horizon** (Monday–Friday). Every Friday, the planning team decides which cases from the waiting list will be performed the following week — *who*, *when*, and *in which room*.
+A large hospital group needs to decide, for each elective surgical case on its waiting
+list, **which procedure happens in which operating room, on which day, and with which
+surgeon**, across a **one-week planning horizon** at a single hospital. The hospital
+cannot run every waiting-list case this week — room-hours, surgeon-hours and a couple
+of shared resources are scarce — so the model must also decide **which cases to leave
+for a later week**, and do so in a way that respects clinical urgency.
 
-The problem combines:
-- **Case selection**: not all cases fit in one week (~7,000 patients on the CHLN waiting list).
-- **Room allocation**: each room is assigned to a surgical service (the *MSS — Master Surgery Schedule*).
-- **Surgeon scheduling**: each surgeon has daily and weekly operative time limits.
-- **Priority rules**: the Portuguese SIGIC system mandates that scheduling respects both **clinical priority** and **waiting-list antiquity**.
+This is the generic "advance scheduling" problem described in the case study: it
+covers case selection, room assignment, and day assignment; it deliberately stops short
+of within-day sequencing, staffing rosters, and downstream bed management in full
+generality (see §7-8 for exactly what is included and why).
 
----
+## 2. Why This Structure — Evidence, Not a Specific Country's Law
 
-## 2. Context & Motivation
+The priority-tier + maximum-wait-time + escalating-penalty mechanism used below is not
+this model's own invention — it mirrors how several public health systems actually
+prioritise elective waiting lists, which is good evidence that it is a reasonable
+general-purpose mechanism rather than an ad hoc choice:
 
-### 2.1 Portuguese SNS / SIGIC Rules
+- **Portugal's SIGIC** (*Sistema Integrado de Gestão de Inscritos para Cirurgia*,
+  Portaria n.º 45/2008) defines four clinical priority tiers with maximum wait times of
+  270/60/15/3 days, and audited 2016 data showed 16% of ~7,400 waiting-list patients had
+  already exceeded their tier's deadline by an average of 147 days (Marques & Captivo,
+  2015) — i.e. breach penalties are not a cosmetic detail, they are the thing the
+  planner is graded on.
+- The **UK NHS Referral-to-Treatment (RTT)** framework and several **Canadian
+  provincial wait-time benchmarks** use the same shape (tiered maximum waits, tracked
+  breach rates) for the same reason: a single FIFO queue does not reflect clinical risk,
+  and an unweighted "shortest job first" heuristic does not either.
+- **Cardoen, Demeulemeester & Beliën (2010)**, the standard literature review for this
+  problem family, classify "advance scheduling" (assigning cases to a day, without
+  necessarily fixing the intra-day sequence) as a distinct, well-studied sub-problem —
+  which is the scope this baseline targets.
 
-The *Sistema Integrado de Gestão de Inscritos para Cirurgia* (SIGIC, Portaria n.º 45/2008) defines four clinical priority levels with maximum waiting times:
+Every numeric value attached to this mechanism (`max_wait_days`, `priority_multiplier`,
+the penalty curve) is an **instance-level, overridable parameter** in the code
+(`PlanningInstance`, `src/model/types.py`) — a hospital plugs in its own waiting-list
+policy without touching the solver.
 
-| Priority | Clinical Description     | Maximum Wait (days) |
-|----------|--------------------------|---------------------|
-| 1        | Normal                   | 270                 |
-| 2        | Priority                 | 60                  |
-| 3        | Very Priority            | 15                  |
-| 4        | Deferred Urgent          | 3                   |
+## 3. Assumptions and Simplifications
 
-**Key operational fact (CHLN data, 2016):** Of 7,374 patients on the LIC, 16% had already exceeded their maximum wait time, with an average delay of 147 days. Neurosurgery cases waited an average of 261 days overdue. This makes the penalty structure in the objective function critical, not cosmetic.
+Stated explicitly, as requested — these are deliberate scoping choices, not oversights:
 
-### 2.2 What is *Advanced Scheduling*?
+1. **Advance scheduling only.** We assign cases to a (day, room); we do not fix the
+   order of cases within a room-day in the baseline (the interval-based production model
+   in PRODUCTION_FORMULATION.md does fix exact start times — see that document for why
+   that upgrade matters operationally).
+2. **Deterministic durations.** Each case has one estimated operative duration (e.g. a
+   historical median for that procedure type). Real durations are stochastic; we treat
+   the deterministic case as the standard tractable approximation (Denton, Miller,
+   Balasubramanian & Huschka, 2010, take the same approach and discuss the stochastic
+   extension — see §10).
+3. **Fixed turnover/cleaning time** is added to every case's room-occupation time as a
+   constant buffer (`t_clean`), not modeled as a separate sequence-dependent activity.
+4. **Surgeons are the binding staffing resource.** Nurses and anaesthetists are assumed
+   to be allocated by a separate, pre-existing roster that tracks whatever room is
+   staffed that day — a common real assumption when the surgeon's calendar, not the
+   support staff's, is the actual bottleneck.
+5. **One occurrence per patient per week.** A patient with multiple queued procedures
+   gets at most one done this week — a conservative default; some services do
+   legitimately co-operate same-day, multi-procedure cases, but that is service-specific
+   and not assumed here.
+6. **One shared resource family is modeled explicitly: equipment.** Real instances often
+   list shared equipment (a C-arm/imaging unit, specialist instrument trays) as a
+   bottleneck distinct from the room itself. We include it, but — consistent with
+   "advance scheduling, no intra-day clock" — only as a **day-level aggregate cap** (see
+   C10 below); see §8 and PRODUCTION_FORMULATION.md for the exact, time-based version.
+7. **Downstream recovery/ICU beds are excluded from this baseline** (see §8) — multi-day
+   bed occupancy genuinely needs a different time granularity than "which day", and we
+   would rather model it correctly later than approximate it badly now. It is the
+   single biggest planned upgrade in PRODUCTION_FORMULATION.md.
+8. **One ad hoc institutional rule is included as a worked example, not a special
+   case in the math:** a configurable "pediatric block" carve-out (a given service's
+   rooms, on a given day, restricted to patients under some age). Hospitals accumulate
+   rules like this constantly; the point of including one is to show it costs nothing
+   structurally — it is one more eligibility predicate, not a new variable family.
 
-Following Cardoen et al. (2010), we focus on the **advance scheduling** phase: assigning cases to specific days and rooms, but **not** determining the exact sequence within a day (that is handled at execution time by the nursing team). This simplification is consistent with CHLN practice, confirmed in meetings with surgical directors.
-
----
-
-## 3. Sets and Indices
+## 4. Sets and Indices
 
 | Symbol | Description |
 |--------|-------------|
-| $c \in C$ | Surgical cases (patient–procedure pairs on the LIC) |
-| $d \in D$ | Planning days, $D = \{1, 2, 3, 4, 5\}$ (Mon–Fri) |
-| $b \in B$ | Operating room blocks |
-| $r \in R_b$ | Rooms within block $b$; write $R = \bigcup_b R_b$ |
-| $s \in S$ | Surgical services (ORL, ORT, CVA, …) |
-| $n \in N$ | Patients (a patient may have multiple LIC entries) |
+| $c \in C$ | Surgical cases (one entry per patient-procedure pair on the waiting list) |
+| $d \in D$ | Planning days, $D = \{1,\dots,5\}$ (one work week) |
+| $r \in R$ | Operating rooms |
 | $h \in H$ | Surgeons |
-| $D_c \subseteq D$ | Days on which case $c$ may be scheduled ($D_c = \{d_1\}$ for Priority 4; $D_c = D$ otherwise) |
+| $e \in E$ | Shared equipment types (e.g. a mobile imaging unit) |
+| $D_c \subseteq D$ | Days on which case $c$ may be scheduled ($D_c=\{1\}$ for priority-4 cases; $D_c = D$ otherwise) |
 
----
-
-## 4. Parameters
+## 5. Parameters
 
 | Symbol | Description |
 |--------|-------------|
-| $d_1$ | First planning day (Monday) |
-| $d_u$ | Last planning day (Friday) |
-| $t_c^{\text{cir}}$ | Operative duration of case $c$ (minutes); deterministic estimate from CID-9-MC historical medians |
-| $t_c^{\text{lim}}$ | Room cleaning/turnover time after case $c$ (minutes; default 20 min) |
-| $t_c^{\text{tot}} = t_c^{\text{cir}} + t_c^{\text{lim}}$ | Total room occupation time |
-| $k_{dbr}$ | Capacity of room $r$ in block $b$ on day $d$ (minutes of opening) |
-| $k_{hd}^{\text{dia}}$ | Surgeon $h$'s daily operative time limit on day $d$ (minutes) |
-| $k_h^{\text{sem}}$ | Surgeon $h$'s weekly operative time limit (minutes) |
-| $a_{dbr}^s \in \{0,1\}$ | 1 if room $r$, block $b$, day $d$ is assigned to service $s$ (from MSS) |
-| $p_c \in \{1,2,3,4\}$ | Clinical priority of case $c$ |
-| $\text{amb}_c$ | Scope: 1 = conventional (inpatient), 2 = ambulatory (day-case) |
-| $i_c$ | Age of patient associated with case $c$ |
-| $wl_c^{\text{dia}}$ | Date case $c$ entered the waiting list (days before $d_1$) |
-| $wl_c^{\text{max}}$ | Maximum waiting days for priority $p_c$: 270/60/15/3 |
-| $dd_c = wl_c^{\text{dia}} + wl_c^{\text{max}} - d_1$ | Days remaining until deadline ($< 0$ = already overdue) |
-| $w_c$ | Non-scheduling penalty for case $c$ (see §5.3) |
-| $\alpha > 1$ | Urgency multiplier for overdue cases in the objective (default 2.0) |
-| $n_c$ | Patient associated with case $c$ |
-| $h_c$ | Surgeon assigned to case $c$ |
-| $s_c$ | Service of case $c$ |
-| $i$ | Paediatric age limit (8 years, ORL Friday circuit) |
+| $t_c^{\text{op}}$ | Operative duration of case $c$ (minutes) |
+| $t_c^{\text{clean}}$ | Fixed room turnover/cleaning time after case $c$ (minutes; default 20) |
+| $t_c^{\text{tot}} = t_c^{\text{op}} + t_c^{\text{clean}}$ | Total room-occupation time |
+| $k_{dr}$ | Capacity of room $r$ on day $d$ (minutes open) |
+| $k_{hd}$ | Surgeon $h$'s daily operative-time limit on day $d$ (minutes) |
+| $k_h$ | Surgeon $h$'s weekly operative-time limit (minutes) |
+| $a_{dr}^{s} \in \{0,1\}$ | 1 if room $r$ on day $d$ is rostered to service $s$ |
+| $p_c \in \{1,2,3,4\}$ | Clinical priority of case $c$ (4 = must run this week, day 1) |
+| $\text{wl}_c$ | Days case $c$ has already waited, as of the planning date |
+| $\text{wl}^{\max}_p$ | Maximum clinically-acceptable wait for priority $p$ (default: 270/60/15/3 days) |
+| $dd_c = \text{wl}^{\max}_{p_c} - \text{wl}_c$ | Days of slack to deadline (negative = already overdue) |
+| $\mu_p$ | Priority-to-priority-1 penalty multiplier (default 1 / 4.5 / 18 / 90) |
+| $w_c$ | Non-scheduling penalty weight for case $c$ (§6.3) |
+| $\alpha > 1$ | Urgency multiplier applied to overdue cases' day coefficient (default 2.0) |
+| $u_{ce} \in \{0,1\}$ | 1 if case $c$ requires equipment $e$ |
+| $\kappa_{ed}$ | Day-level cap on the number of equipment-$e$ cases on day $d$ |
+| $\text{ped}=(s^\dagger, d^\dagger, i^\dagger)$ | Optional pediatric-block rule: service $s^\dagger$'s rooms on day $d^\dagger$ admit only patients aged $\le i^\dagger$ |
 
----
+## 6. Model
 
-## 5. Model
-
-### 5.1 Decision Variables
+### 6.1 Decision Variables
 
 $$
-x_{cdbr} = \begin{cases} 1 & \text{if case } c \text{ is scheduled on day } d, \text{ block } b, \text{ room } r \\ 0 & \text{otherwise} \end{cases}
-\quad \forall c \in C,\; d \in D_c,\; b \in B,\; r \in R_b
+x_{cdr} \in \{0,1\} \quad \forall c \in C,\ d \in D_c,\ r \in R
+\qquad\text{— 1 if case $c$ is scheduled on day $d$ in room $r$}
 $$
 
 $$
-z_c \geq 0 \quad \forall c \in C
+z_c \ge 0 \quad \forall c \in C : p_c \ne 4
+\qquad\text{— 1 if case $c$ is NOT scheduled this week (forced to \{0,1\} by C3)}
 $$
 
-$z_c$ is an auxiliary variable that equals 1 when case $c$ is **not** scheduled. It is defined in $\mathbb{R}^+$ but takes values in $\{0, 1\}$ by force of constraint (5.3). For Priority-4 cases, $z_c = 0$ is enforced explicitly.
+> **Pre-filtering.** In code, $x_{cdr}$ is only created for triples that pass the
+> room-service roster, ambulatory-only, pediatric-block and surgeon-availability checks
+> — the same role as eliminating $a_{dr}^{s_c}=0$ terms analytically. This is the main
+> variable-count reduction mechanism (see `_feasible_triples` in
+> `src/solvers/milp_baseline_solver.py`).
 
-> **Implementation note:** Pre-filtering eliminates $x_{cdbr}$ where $a_{dbr}^{s_c} = 0$. This reduces the number of binary variables by ~85% in the CHLN instance, giving a significant speed-up (Marques & Captivo, 2015, §5.3 rationale).
-
-### 5.2 Constraints
-
-**(5.1) One procedure per patient per week**
-
-A patient with multiple LIC entries may only be called for one surgery per planning horizon. Services that routinely operate cooperatively handle this separately.
+### 6.2 Objective Function
 
 $$
-\sum_{\substack{c \in C:\\ n_c = n}} \sum_{d \in D} \sum_{b \in B} \sum_{r \in R_b} x_{cdbr} \leq 1, \quad \forall n \in N
+\min \quad
+\underbrace{\sum_{c:\,dd_c \ge 0}\ \sum_{d \in D_c, r \in R} \big[dd_c + d\big]\, x_{cdr}}_{\text{Term 1 — on-time cases, prefer earlier days}}
+\ +\
+\underbrace{\sum_{c:\,dd_c < 0}\ \sum_{d \in D_c, r \in R} \big[dd_c + \alpha d\big]\, x_{cdr}}_{\text{Term 2 — overdue cases, urgency multiplier }\alpha}
+\ +\
+\underbrace{\sum_{c:\,p_c \ne 4} p_c\, w_c\, z_c}_{\text{Term 3 — non-scheduling penalty}}
 $$
 
-**(5.2) Priority-4 (Deferred Urgent) on day 1**
+(here $d \in \{1,\dots,5\}$ is the numeric index of the day, i.e. $d=1$ for the first
+day of the horizon — matching `d_val` in the code.)
 
-$wl_c^{\text{max}} = 3$ days. Since planning is done on Friday for the following week, these cases must be performed on Monday or they will exceed the clinical limit.
+**Reading it:** Term 1 makes the model prefer to schedule cases with little slack left
+sooner rather than later; Term 2 does the same for already-overdue cases but multiplies
+the day coefficient by $\alpha>1$, so deferring an overdue case to later in the week is
+disproportionately expensive. Term 3's weight $w_c$ is calibrated (§6.3) to always
+exceed any Term-1/2 coefficient, so the model only leaves a case unscheduled when no
+feasible slot exists — never as a cheaper alternative to scheduling it late.
 
-$$
-\sum_{b \in B} \sum_{r \in R_b} x_{c, d_1, b, r} = 1, \quad \forall c \in C : p_c = 4
-$$
-
-**(5.3) Schedule or penalise (non-urgent cases)**
-
-Every non-Priority-4 case is either scheduled exactly once, or it incurs the penalty $w_c$:
-
-$$
-\sum_{d \in D} \sum_{b \in B} \sum_{r \in R_b} x_{cdbr} + z_c = 1, \quad \forall c \in C : p_c \neq 4
-$$
-
-**(5.4) Service–room assignment (MSS)**
-
-Rooms may only host cases from the service assigned by the Master Surgery Schedule:
+### 6.3 Non-scheduling penalty $w_c$
 
 $$
-\sum_{\substack{c \in C:\\ s_c = s}} x_{cdbr} \leq a_{dbr}^s \cdot M, \quad \forall s \in S,\; d \in D,\; b \in B,\; r \in R_b
+w_c = \text{PenaltyCurve}\big(dd_c \cdot \mu_{p_c}\big) + 1.2 \cdot \max_{c' \in C} dd_{c'}
 $$
 
-where $M = |C|$ is a sufficiently large constant. When $a_{dbr}^s = 0$, all associated $x_{cdbr}$ are forced to zero — this is the main variable-reduction mechanism.
+`PenaltyCurve` is a piecewise-increasing function of (priority-normalised) days to
+deadline — sharp escalation as the deadline approaches and is breached (see
+`src/model/penalty.py`; shape adapted from Marques & Captivo, 2015, §5.1). The
+displacement term `1.2 * max(dd)` guarantees $w_c$ dominates every Term-1/2
+coefficient, which is what makes Term 3 a true last resort.
 
-**(5.5) Ambulatory-only block**
+### 6.4 Constraints
 
-The *Bloco Ambulatório de Urologia* only hosts day-case procedures ($\text{amb}_c = 2$):
-
+**C1 — at most one scheduled occurrence per patient per week**
 $$
-\sum_{\substack{c \in C:\\ \text{amb}_c \neq 2,\; s_c = \text{URO}}} x_{cdbr} = 0, \quad \forall d \in D,\; r \in R_b : b = B_{\text{URO\_AMB}}
-$$
-
-**(5.6) ORL paediatric circuit (Friday)**
-
-Every Friday the ORL block operates only patients aged $\leq i = 8$ years:
-
-$$
-\sum_{\substack{c \in C:\\ i_c > i,\; s_c = \text{ORL}}} x_{c, d_u, b, r} = 0, \quad \forall r \in R_b : b = B_{\text{ORL}}
+\sum_{\substack{c \in C:\\ \text{patient}(c)=n}} \sum_{d,r} x_{cdr} \le 1 \qquad \forall n
 $$
 
-**(5.7) Room capacity — no overtime**
-
-The total room occupation (surgery + cleaning) may not exceed the room's opening hours:
-
+**C2 — priority-4 cases must run on day 1**
 $$
-\sum_{c \in C} t_c^{\text{tot}} \cdot x_{cdbr} \leq k_{dbr}, \quad \forall d \in D,\; b \in B,\; r \in R_b
+\sum_{r \in R} x_{c,1,r} = 1 \qquad \forall c \in C : p_c = 4
 $$
 
-**(5.8) Surgeon daily time limit**
-
-Each surgeon's daily operative time is bounded. This constraint also prevents double-booking (a surgeon in two rooms simultaneously), because $k_{hd}^{\text{dia}} = \min(\text{surgeon limit}, \text{max room capacity on day } d)$:
-
+**C3 — every other case is scheduled exactly once, or penalised**
 $$
-\sum_{\substack{c \in C:\\ h_c = h}} \sum_{b \in B} \sum_{r \in R_b} t_c^{\text{cir}} \cdot x_{cdbr} \leq k_{hd}^{\text{dia}}, \quad \forall h \in H,\; d \in D
+\sum_{d \in D,\, r \in R} x_{cdr} + z_c = 1 \qquad \forall c \in C : p_c \ne 4
 $$
 
-**(5.9) Surgeon weekly time limit**
-
+**C4 — room-service roster** (enforced by the pre-filter, not a separate row)
 $$
-\sum_{\substack{c \in C:\\ h_c = h}} \sum_{d \in D} \sum_{b \in B} \sum_{r \in R_b} t_c^{\text{cir}} \cdot x_{cdbr} \leq k_h^{\text{sem}}, \quad \forall h \in H
-$$
-
-**(5.10–5.11) Variable domains**
-
-$$
-x_{cdbr} \in \{0, 1\}, \quad \forall c \in C,\; d \in D_c,\; b \in B,\; r \in R_b
-$$
-$$
-z_c \geq 0, \quad \forall c \in C
+x_{cdr} = 0 \quad \text{whenever } a_{dr}^{\,\text{service}(c)} = 0
 $$
 
-### 5.3 Objective Function
+**C5 — ambulatory-only rooms admit only day-case scopes** (pre-filter)
 
-The objective captures the two SIGIC principles — **priority** and **antiquity** — plus a strong penalty for non-scheduling:
+**C6 — pediatric-block rule** (pre-filter): on day $d^\dagger$, service $s^\dagger$'s
+rooms admit no case with patient age $> i^\dagger$.
 
+**C7 — room capacity (no overtime)**
 $$
-\min \underbrace{\sum_{\substack{c \in C:\\ dd_c \geq 0}} \sum_{d \in D} \sum_{b \in B} \sum_{r \in R_b} \bigl[(dd_c - d_1) + d\bigr] \cdot x_{cdbr}}_{\text{Term 1: on-time cases — prefer earlier scheduling}}
-$$
-$$
-+ \underbrace{\sum_{\substack{c \in C:\\ dd_c < 0}} \sum_{d \in D} \sum_{b \in B} \sum_{r \in R_b} \bigl[(dd_c - d_1) + \alpha \cdot d\bigr] \cdot x_{cdbr}}_{\text{Term 2: overdue cases — urgency multiplier } \alpha > 1}
-$$
-$$
-+ \underbrace{\sum_{c \in C} p_c \cdot w_c \cdot z_c}_{\text{Term 3: penalty for non-scheduling}}
+\sum_{c \in C} t_c^{\text{tot}}\, x_{cdr} \le k_{dr} \qquad \forall d \in D,\, r \in R
 $$
 
-**Interpretation:**
-- **Term 1:** For on-time cases, the coefficient $(dd_c - d_1) + d$ is larger when the deadline is far away and the chosen day is later in the week. The model prefers cases with less time remaining and earlier days.
-- **Term 2:** For overdue cases, multiplying the day index by $\alpha > 1$ makes it more expensive to defer them to later in the week, effectively urgentising their scheduling.
-- **Term 3:** $w_c = \text{PenaltyFactor}(p_c, dd_c) + 1.2 \cdot \max_{c'} dd_{c'}$ ensures this term dominates Terms 1–2, so the model always prefers to schedule rather than leave cases unscheduled when feasible.
+**C8 — surgeon daily time limit**
+$$
+\sum_{\substack{c:\,\text{surgeon}(c)=h}} \sum_{r} t_c^{\text{op}}\, x_{cdr} \le k_{hd} \qquad \forall h \in H,\, d \in D
+$$
 
-**Priority multipliers** (Tabela 5.1, Marques & Captivo 2015):
+**C9 — surgeon weekly time limit**
+$$
+\sum_{\substack{c:\,\text{surgeon}(c)=h}} \sum_{d,r} t_c^{\text{op}}\, x_{cdr} \le k_h \qquad \forall h \in H
+$$
 
-| Priority | Multiplier | Interpretation |
-|----------|-----------|----------------|
-| 1        | ×1        | Base reference |
-| 2        | ×4.5      | 1 overdue day in P2 ≡ 4.5 overdue days in P1 |
-| 3        | ×18       | 1 overdue day in P3 ≡ 18 overdue days in P1 |
-| 4        | ×90       | 1 overdue day in P4 ≡ 90 overdue days in P1 |
+**C10 — shared equipment, day-level aggregate cap**
+$$
+\sum_{\substack{c:\,u_{ce}=1}} \sum_{r} x_{cdr} \le \kappa_{ed} \qquad \forall e \in E,\, d \in D
+$$
 
----
-
-## 6. Model Classification and Complexity
-
-- **Problem type:** Mixed-Integer Linear Programme (MILP).
-- **NP-hardness:** Follows from reduction to Bin Packing (room capacity constraints alone are NP-hard).
-- **Variable count (CHLN):** $|C| \cdot |D| \cdot \sum|R_b| \approx 7000 \times 5 \times 28 \approx 980,000$ binary variables before pre-filtering; ~130,000 after filtering via (5.4).
-- **Practical solvability:** The block-diagonal structure (rooms partitioned by service) allows near-perfect decomposition. Marques & Captivo report optimal solutions in under 5 minutes with CPLEX on CHLN-scale instances.
-
----
+This counts *how many* equipment-$e$ cases land on day $d$, not whether their actual
+clock times overlap — a deliberately coarse approximation consistent with this model's
+day-only granularity. It is the one constraint where the production CP-SAT model's
+upgrade (exact concurrency via `AddCumulative`) measurably changes what's achievable —
+see RESULTS.md, where it is the single largest source of the baseline/production
+objective gap on the medium instance.
 
 ## 7. What We Include and Why
 
 | Included | Rationale |
-|----------|-----------|
-| SIGIC priority + antiquity in objective | Legally mandated by Portuguese NHS; without it, the model is clinically invalid |
-| Room capacity constraint (5.7) | Core feasibility: overtime is forbidden by Portuguese labour law |
-| Surgeon daily + weekly limits (5.8–5.9) | Prevents both overwork and double-booking (elegant double duty of one constraint) |
-| Service–room assignment via MSS (5.4) | Each room requires specialty-specific equipment; moving equipment between rooms risks damage |
-| ORL paediatric circuit (5.6) | Confirmed operational rule; violating it would cause patient safety concerns |
-| Priority-4 on day 1 (5.2) | Clinical obligation; 72-hour window closes before any other weekday |
-| One case per patient per week (5.1) | Conservative default; cooperative scheduling is service-specific and not uniformly agreed |
-| Deterministic durations | Historical medians by service × CID-9-MC category; stochastic extension discussed below |
-
----
+|---|---|
+| Priority + waiting-time penalty in the objective | Evidence-based across multiple real systems (§2); without it the model is clinically blind to urgency |
+| Room capacity (C7) | Core feasibility — a room cannot run over its opening hours |
+| Surgeon daily + weekly limits (C8-C9) | Prevents overwork; at the daily-aggregate level also approximates "can't be in two rooms at once" |
+| Room-service roster (C4) | Rooms are equipped/staffed for one specialty at a time in practice |
+| One case per patient per week (C1) | Conservative default; avoids double-booking the same patient |
+| Priority-4 locked to day 1 (C2) | These cases' clinical deadline is inside the current planning cycle — there is no "later this week" |
+| Shared equipment, day-level (C10) | Explicitly named in the case prompt as a realistic bottleneck; modeled at the granularity this baseline supports |
+| One ad hoc rule worked example (C6) | Demonstrates the model absorbs institution-specific carve-outs without new variable families |
+| Deterministic durations | Standard tractable approximation (Denton et al., 2010); stochastic extension noted in §10 |
 
 ## 8. What We Exclude and Why
 
 | Excluded | Rationale |
-|----------|-----------|
-| Within-day sequencing | Hospital confirmed *advanced scheduling* only; nursing teams handle ordering |
-| Anaesthesiologists and nurses | MSS pre-allocates them; confirmed by anaesthesiology director as non-binding |
-| Recovery/ICU bed constraints | Adds significant complexity; downstream constraint for future extension |
-| Equipment sharing between rooms | Uncommon in practice; modelled implicitly by MSS |
-| Stochastic surgery durations | Deterministic approximation is standard in the literature (Denton et al. 2010); adds tractability |
-| Patient preferences for days | Not part of SIGIC protocol; relevant for future patient-centred extensions |
+|---|---|
+| Within-day sequencing / exact start times | Out of scope for *advance* scheduling (Cardoen et al., 2010); see PRODUCTION_FORMULATION.md, which adds it |
+| Exact (time-based) equipment concurrency | Needs a clock; the baseline doesn't have one — see C10 above and the production model |
+| Downstream recovery/ICU beds | Multi-day occupancy needs a different time unit than "day of surgery"; modeling it as a day-bucket would likely be wrong in either direction. Included properly in PRODUCTION_FORMULATION.md once interval/cumulative machinery is available |
+| Nurses / anaesthetists as separate resources | Assumed pre-allocated by a roster tied to the room, not the case — a common simplification when they aren't the binding constraint |
+| Stochastic durations | Adds real value (robustness) but also real complexity; flagged as the top extension in §10, not attempted here |
+| Patient day-of-week preference | Not part of any clinical-priority system we used as evidence; a natural patient-centred extension |
 
----
+## 9. Testing Against Real and Literature Instances
 
-## 9. Open Questions (Interview)
+Two demo-scale instances ship in `src/data/instances.py`:
 
-### Q1: Passing the Torch
+- `demo_instance()` — ~20 cases, sized to read by eye, exercising every constraint
+  family (priority lock-in, equipment contention, pediatric block).
+- `medium_instance()` — ~200 cases / 12 rooms / 5 services, structurally modeled on the
+  multi-service, multiple-rooms-per-service shape used in the OR-scheduling benchmark
+  literature (Cardoen, Demeulemeester & Beliën, 2010), used for the scaling trade-off in
+  RESULTS.md.
 
-To hand this formulation to a developer:
+For testing against **real hospital data** at production scale, two public,
+CC BY-4.0-licensed datasets are a direct fit for this exact problem (same horizon, same
+"Master Surgery Schedule" structure as §6.4's room roster):
 
-1. **This markdown + code** — the formulation is self-contained and the code mirrors it exactly (same constraint numbering, same variable names).
-2. **Entity–Relationship diagram** — show Tables: Cases, Patients, Surgeons, Rooms, MSS (service-room-day triples). The `PlanningInstance` dataclass already encodes this schema.
-3. **Acceptance test suite** — `tests/test_model.py` has 7 tests that any correct implementation must pass: P4 on day 1, room capacity, surgeon limits, paediatric circuit, feasibility of greedy and MILP.
-4. **Minimum reproducible instance** — the `demo_chln()` instance with 20 cases and known optimal objective value. The developer verifies their implementation against this before scaling.
-5. **Domain glossary** — LIC, MSS, SIGIC, prioridade, âmbito, higienização — shared vocabulary prevents misunderstandings between OR scientists and engineers.
+- **Akbarzadeh & Maenhout, "Real life data for operating room scheduling problem"**
+  (Ghent University Hospital OR log, May 2017) — Mendeley Data, DOI
+  [10.17632/n2v49z2vnp.2](https://data.mendeley.com/datasets/n2v49z2vnp/2).
+- **Akbarzadeh & Maenhout, "RealLife operating room scheduling dataset, 2021-Jan-May"**
+  — 20 weekly-planning instances across 8 demand/flexibility configurations, Mendeley
+  Data, DOI [10.17632/c8d342266x.1](https://data.mendeley.com/datasets/c8d342266x/1).
 
-The key principle: *the code is the specification*. Constraint (5.7) in the markdown corresponds to `C57_RoomCapacity` in `pyomo_solver.py` and the analogous block in `pulp_cbc_solver.py`. A developer reading both documents simultaneously should have no ambiguity.
-
-### Q2: A Library of Models
-
-Organise the library around **four layers**:
-
-1. **Core abstractions** (`BaseSolver`, `PlanningInstance`, typed data structures) — solver-agnostic, no external dependencies, fully unit-testable.
-2. **Domain building blocks** (`CapacityConstraint`, `ResourceLimitConstraint`, `PriorityWeighting`, `TimeWindowConstraint`) — reusable across healthcare scheduling problems (nurse rostering, bed allocation, equipment assignment).
-3. **Problem templates** (`SurgeryScheduler`, `NurseRoster`, `BedAllocation`) — compositions of domain blocks, configurable via YAML/JSON without touching Python code.
-4. **Institution configurations** (`CHLN_Config`, `HospitalX_Config`) — override defaults (MSS structure, SIGIC parameters, special rules) for each client.
-
-The solver layer is orthogonal: the same `ConcreteModel` is compiled to CBC, Gurobi, CPLEX, or HiGHS by passing a string flag. This lets us switch backends as licence availability or instance size demands, without rewriting the formulation.
-
----
+Both are real hospital logs released for exactly this kind of benchmarking, and their
+schema (a master roster + per-case waiting-list records) maps directly onto
+`PlanningInstance`: a loader would parse their case list into `SurgicalCase` rows and
+their room/day roster into `OperatingRoom.service_assignment`, with no formulation
+changes needed. This repo does not ship a parser for them (out of scope for a small
+demo, per the case's own framing), but they are the right next step before any pilot
+with a real hospital's data.
 
 ## 10. Extensions and Future Work
 
 | Extension | Approach |
-|-----------|----------|
-| Stochastic durations | Two-stage SP: first stage selects cases, second stage handles duration scenarios with recourse (overtime cost or case removal) |
-| ICU/ward bed constraints | Add downstream capacity constraints; link to bed management module |
-| Nurse and anaesthesiologist scheduling | Extend H to include staff teams; add team-level constraints |
-| Multi-week rolling horizon | Solve weekly, carry-forward unscheduled cases with increased priority weight |
-| Robust scheduling | Min-max regret formulation; buffer time between cases proportional to $\sigma$ of duration distribution |
-| Real-time rescheduling | LNS (Large Neighbourhood Search) for intra-day disruptions (emergency cases, equipment failure) |
+|---|---|
+| Stochastic durations | Two-stage stochastic program: first stage selects/places cases, second stage absorbs duration realisations via overtime cost or case bump |
+| Exact equipment + downstream beds | Already done — see PRODUCTION_FORMULATION.md |
+| Nurse/anaesthetist rostering | Extend $H$ to cover support staff; add team-level NoOverlap/sum constraints, same pattern as surgeons |
+| Multi-week rolling horizon | Solve weekly; carry forward unscheduled cases with an increased priority weight |
+| Robust scheduling | Min-max regret or chance-constrained room capacity, buffer proportional to duration variance |
+| Real-time rescheduling | Large Neighbourhood Search seeded from the current schedule, for same-day disruptions |
 
----
+## 11. Open Questions
 
-## 11. References
+### Q1 — Passing the Torch
 
-1. Marques, I., & Captivo, M.E. (2015). *Planeamento de cirurgias eletivas no Centro Hospitalar Lisboa Norte*. MSc Thesis, Universidade de Lisboa.
-2. Cardoen, B., Demeulemeester, E., & Beliën, J. (2010). Operating room planning and scheduling: A literature review. *European Journal of Operational Research*, 201(3), 921–932.
-3. Denton, B.T., Miller, A.J., Balasubramanian, H.J., & Huschka, T.R. (2010). Optimal allocation of surgery blocks to operating rooms under uncertainty. *Operations Research*, 58(4), 802–816.
-4. SIGIC — Sistema Integrado de Gestão de Inscritos para Cirurgia. Portaria n.º 45/2008, Diário da República, Portugal.
-5. Vanhoucke, M., Rodammer, F., Straeten, G., & Cardoen, B. (2007). *Operating Theatre Planning and Scheduling*. Springer.
-6. Van Riet, C., & Demeulemeester, E. (2015). Trade-offs in operating room planning for electives and emergencies. *OR Spectrum*, 37(1), 59–87.
+I'd hand a developer four things, not just the math: **(1)** this file plus
+`src/model/types.py` — the dataclasses *are* the data dictionary (sets/parameters above
+map 1:1 to fields), so there's one source of truth for "what is a case/room/surgeon",
+not two. **(2)** the solver code itself, since every constraint here is labeled (C1…C10)
+and the matching code block carries the same label as a comment — read side by side,
+there's no ambiguity about which line implements which formula. **(3)**
+`tests/test_model.py` as the acceptance contract: any reimplementation must pass the
+same hard-constraint checks (`_assert_hard_constraints`) on the same demo instance, and
+I'd ask them to add a test per new constraint before writing the constraint. **(4)** a
+short glossary of the few domain terms that aren't self-explanatory (e.g. "MSS"/room
+roster, "ambulatory", priority tiers) — most miscommunication on these projects is
+vocabulary, not math.
+
+### Q2 — A Library of Models
+
+I'd structure it in four layers, solver-agnostic at every layer except the bottom one.
+First, core data abstractions — typed dataclasses like `PlanningInstance`, with no
+solver imports — that any model is built on top of. Second, a small set of reusable
+*constraint patterns* (capacity-sum, no-double-booking via NoOverlap, tiered-priority
+tardiness objective, eligibility pre-filter) that recur across scheduling problems,
+since nurse rostering and bed allocation need the same shapes, not the same model.
+Third, problem templates that compose those patterns into a specific formulation —
+this repo's baseline and production models are two such templates. Fourth, a thin
+solver-adapter layer, one file per backend family (MILP, CP, local search), so a new
+problem picks a backend without rewriting how its constraints are expressed. The
+baseline-vs-production-vs-local-search trade-off this repo demonstrates is itself a
+template for that last layer: profile the instance sizes you'll actually see, then pick
+the cheapest model that meets the latency/quality bar at that scale.
+
+## 12. References
+
+1. Cardoen, B., Demeulemeester, E., & Beliën, J. (2010). Operating room planning and
+   scheduling: A literature review. *European Journal of Operational Research*, 201(3),
+   921-932.
+2. Marques, I., & Captivo, M.E. (2015). *Planeamento de cirurgias eletivas no Centro
+   Hospitalar Lisboa Norte*. MSc thesis, Universidade de Lisboa. (Evidence source for
+   the priority/penalty mechanism shape — not the literal subject of this model.)
+3. Denton, B.T., Miller, A.J., Balasubramanian, H.J., & Huschka, T.R. (2010). Optimal
+   allocation of surgery blocks to operating rooms under uncertainty. *Operations
+   Research*, 58(4), 802-816.
+4. SIGIC — Sistema Integrado de Gestão de Inscritos para Cirurgia, Portaria n.º 45/2008,
+   Diário da República, Portugal. (Evidence source for tiered max-wait policy design.)
+5. Van Riet, C., & Demeulemeester, E. (2015). Trade-offs in operating room planning for
+   electives and emergencies. *OR Spectrum*, 37(1), 59-87.
+6. Akbarzadeh, B., & Maenhout, B. (2023). Real life data for operating room scheduling
+   problem [Data set]. Mendeley Data, V2. https://doi.org/10.17632/n2v49z2vnp.2
+7. Akbarzadeh, B., & Maenhout, B. (2023). RealLife operating room scheduling dataset,
+   2021-Jan-May [Data set]. Mendeley Data, V1. https://doi.org/10.17632/c8d342266x.1
