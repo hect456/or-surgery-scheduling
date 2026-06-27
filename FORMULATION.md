@@ -379,6 +379,7 @@ $$
 x_{cdr} \in \{0,1\} \quad \forall c \in C,\ d \in D_c,\ r \in R
 \qquad\text{— 1 if case $c$ is scheduled on day $d$ in room $r$}
 $$
+
 $$
 z_c \in [0,1] \quad \forall c \in C : p_c \ne 4
 \qquad\text{— relaxed to a continuous bound; forced to binary by C3 at the optimum}
@@ -409,24 +410,27 @@ were fixed together, since both called the same `penalty.py` function the same w
 
 ### A.3 Non-scheduling Penalty
 
-Identical to §8.1 / FORMULATION_CP.md §4.1: $w_c = \mu_{p_c} \cdot
-\text{PenaltyCurve}(dd_c) + 1.2 \cdot \max_{c'} dd_{c'}$, evaluated once in
-`src/model/penalty.py` and shared by every solver (MIP, CP, Hexaly, greedy) — there is
+Identical to §8.1 / FORMULATION_CP.md §4.1:
+$w_c = \mu_{p_c} \cdot \text{PenaltyCurve}(dd_c) + 1.2 \cdot \max_{c'} dd_{c'}$, evaluated
+once in `src/model/penalty.py` and shared by every solver (MIP, CP, Hexaly, greedy) — there is
 exactly one implementation of $w_c$ in this codebase, not one per backend.
 
 ### A.4 Constraints
 
 **C1 — at most one scheduled occurrence per patient per week**
+
 $$
 \sum_{c:\ \text{patient}(c)=n} \sum_{d,r} x_{cdr} \le 1 \qquad \forall n
 $$
 
 **C2 — priority-4 cases must run on day 1**
+
 $$
 \sum_{r \in R} x_{c,1,r} = 1 \qquad \forall c : p_c = 4
 $$
 
 **C3 — every other case is scheduled exactly once, or penalised**
+
 $$
 \sum_{d,r} x_{cdr} + z_c = 1 \qquad \forall c : p_c \ne 4
 $$
@@ -435,9 +439,11 @@ $$
 pre-filter, exactly as in the CP model.
 
 **C7 — room capacity, as an aggregate sum (not exact non-overlap)**
+
 $$
 \sum_{c \in C} t_c^{\text{tot}}\ x_{cdr} \le k_{dr} \qquad \forall d \in D,\ r \in R
 $$
+
 This is where the MIP and CP models structurally diverge (FORMULATION.md §3): this sum
 certifies durations *fit* the day, not that they don't *collide* — equivalent to exact
 non-overlap for a single room (any non-overlapping set of durations can always be packed
@@ -446,19 +452,23 @@ where the divergence becomes a real, measured difference (see RESULTS.md).
 
 **C8 — surgeon daily time limit (a sum only — no non-overlap variable exists in a MIP
 without a big-M reformulation, see §3)**
+
 $$
 \sum_{c:\ \text{surgeon}(c)=h} \sum_r t_c^{\text{op}}\ x_{cdr} \le k_{hd} \qquad \forall h \in H,\ d \in D
 $$
 
 **C9 — surgeon weekly time limit**
+
 $$
 \sum_{c:\ \text{surgeon}(c)=h} \sum_{d,r} t_c^{\text{op}}\ x_{cdr} \le k_h \qquad \forall h \in H
 $$
 
 **C10 — shared equipment, day-level aggregate cap**
+
 $$
 \sum_{c:\ u_{ce}=1} \sum_r x_{cdr} \le \kappa_{ed} \qquad \forall e \in E,\ d \in D
 $$
+
 Counts *how many* equipment-$e$ cases land on day $d$, not whether their clock times
 overlap — the single largest source of the MIP/CP objective gap measured in RESULTS.md.
 
@@ -524,9 +534,9 @@ $$
 \text{margin}_{\min} = 1 + \frac{\alpha \cdot n_{\text{days}}}{\max_c dd_c}
 $$
 
-For this codebase's defaults ($\alpha=2$, $n_{\text{days}}=5$, and $\max_c dd_c \approx
-270$ for a priority-1 case at its policy's maximum wait), $\text{margin}_{\min} \approx
-1.037$ — so, **contrary to the intuition that prompted this audit, 1.2 was already the
+For this codebase's defaults ($\alpha=2$, $n_{\text{days}}=5$, and
+$\max_c dd_c \approx 270$ for a priority-1 case at its policy's maximum wait),
+$\text{margin}_{\min} \approx 1.037$ — so, **contrary to the intuition that prompted this audit, 1.2 was already the
 conservative-but-correct choice, not an arbitrarily loose one**: 1.01 would actually be
 *unsafe* in general, since $1.01 \times 270 = 272.7$ does not dominate the $\approx 280$
 a worst-case coefficient can reach. 1.2 was chosen as a fixed, instance-independent
@@ -539,9 +549,9 @@ is already sufficient, not broken.
 
 ### B.4 Calibrating the Priority Multipliers in Practice — Worked Discussion
 
-*The question this section answers: the default multipliers are $\mu = (1, 4.5, 18,
-90)$ — how would I actually calibrate these against a real hospital, would I run a
-sensitivity/Pareto sweep, and what about equity across specialties?*
+*The question this section answers: the default multipliers are
+$\mu = (1, 4.5, 18, 90)$ — how would I actually calibrate these against a real hospital,
+would I run a sensitivity/Pareto sweep, and what about equity across specialties?*
 
 **How I'd calibrate them.** Not by literature lookup — there isn't a published "correct"
 multiplier vector, because $\mu_p$ encodes a hospital's own risk tolerance for breaching

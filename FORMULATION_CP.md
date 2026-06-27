@@ -24,9 +24,9 @@ point, not a parallel primary deliverable (FORMULATION.md §12).
 
 ## 2. Sets and Parameters
 
-Unchanged from FORMULATION.md §5–§6: $C, D, R, H, E$ and every $t_c^{\text{op}},
-t_c^{\text{clean}}, t_c^{\text{tot}}, k_{dr}, k_{hd}, k_h, p_c, dd_c, \mu_p, w_c, \alpha,
-u_{ce}, \kappa_{ed}$. Three additions, used only by this model (a day-bucket MILP cannot
+Unchanged from FORMULATION.md §5–§6: $C, D, R, H, E$ and every
+$t_c^{\text{op}}, t_c^{\text{clean}}, t_c^{\text{tot}}, k_{dr}, k_{hd}, k_h, p_c, dd_c, \mu_p, w_c, \alpha, u_{ce}, \kappa_{ed}$.
+Three additions, used only by this model (a day-bucket MILP cannot
 express them — FORMULATION.md Appendix A.4):
 
 | Symbol | Description |
@@ -78,6 +78,7 @@ occupy, without the solver first having to decide which candidates are real.
 > list comprehension in `cp_sat_interval_solver.py`).
 
 For every non-priority-4 case, an unscheduled indicator:
+
 $$
 u_c \in \{0,1\}, \qquad \sum_{d,r} \text{pr}_{cdr} + u_c = 1
 $$
@@ -153,6 +154,7 @@ cleaning buffer has elapsed.
 $$
 \texttt{AddNoOverlap}\big(\{\text{sgiv}_{cdr} : \text{surgeon}(c)=h,\ d \text{ fixed}\}\big) \qquad \forall h \in H,\ d \in D
 $$
+
 $$
 \sum_{c:\ \text{surgeon}(c)=h} \sum_r t_c^{\text{op}}\ \text{pr}_{cdr} \le k_{hd} \qquad \forall h, d \quad \text{(kept, unchanged)}
 $$
@@ -191,9 +193,11 @@ into a day index, then treat the stay as its own interval:
 $$
 \text{dayof}_c = d_{\text{idx}} \quad \text{(via } \texttt{OnlyEnforceIf}\text{, whenever } \text{pr}_{cdr}=1\text{)}
 $$
+
 $$
 \text{bed}_c = \texttt{NewOptionalIntervalVar}\big(\text{dayof}_c,\ \text{los}_c,\ \text{dayof}_c+\text{los}_c,\ 1-u_c\big)
 $$
+
 $$
 \texttt{AddCumulative}\big(\{\text{bed}_c : \rho(c)=\rho\},\ \text{demands}=1,\ \text{capacity}=\beta_\rho\big) \qquad \forall \rho
 $$
