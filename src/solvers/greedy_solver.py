@@ -127,7 +127,8 @@ class GreedySolver(BaseSolver):
         for cid in unscheduled:
             c = case_map[cid]
             if c.priority != Priority.EMERGENT_ADDON:
-                obj += c.priority.value * penalties[cid]
+                # penalties[cid] already includes the priority multiplier.
+                obj += penalties[cid]
 
         return SolverResult(
             status="Feasible",

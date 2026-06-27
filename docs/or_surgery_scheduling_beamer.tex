@@ -3,8 +3,10 @@
 % Primary model: interval-based Constraint Programming (Google OR-Tools
 % CP-SAT). A day-bucket MILP (OR-Tools/CBC, optionally Gurobi) is kept only
 % as the comparison point that justifies that choice; Hexaly is an optional,
-% license-gated extension. Mirrors FORMULATION.md and RESULTS.md in the
-% repository -- same notation, same numbers.
+% license-gated extension. Mirrors FORMULATION.md, FORMULATION_CP.md and
+% RESULTS.md in the repository -- same notation, same numbers. Includes a
+% dedicated section on two corrections (bugs) found and fixed during review,
+% and a parameter-justification audit -- both with worked numeric evidence.
 %
 % Compile with: pdflatex or xelatex (run twice for the table of contents).
 %   pdflatex or_surgery_scheduling_beamer.tex
@@ -243,11 +245,15 @@
 
 \begin{frame}{Decision Variables and Objective}
   \footnotesize
-  For every $(c,d,r)$ surviving the eligibility pre-filter (room-service roster,
-  ambulatory-only, pediatric block, surgeon availability):
+  For every $(c,d,r)$ surviving the eligibility pre-filter, \textbf{two} intervals
+  sharing one start time -- not one interval reused for both resources (a correction,
+  see Corrections section):
   \[
-    \text{pr}_{cdr}\in\{0,1\},\quad \text{start}_{cdr},\,\text{end}_{cdr}\in[0,k_{dr}],
-    \quad \text{iv}_{cdr}=\texttt{NewOptionalIntervalVar}(\text{start}_{cdr},\,t_c^{\text{tot}},\,\text{end}_{cdr},\,\text{pr}_{cdr})
+    \text{pr}_{cdr}\in\{0,1\},\quad \text{start}_{cdr}\in[0,k_{dr}],\quad
+    \text{iv}_{cdr}=\texttt{NewOptionalIntervalVar}(\text{start}_{cdr},\,t_c^{\text{tot}},\,\text{end}_{cdr},\,\text{pr}_{cdr})\ \text{(room)}
+  \]
+  \[
+    \text{sgiv}_{cdr}=\texttt{NewOptionalIntervalVar}(\text{start}_{cdr},\,t_c^{\text{op}},\,\text{sgend}_{cdr},\,\text{pr}_{cdr})\ \text{(surgeon)}
   \]
   and, for every non-priority-4 case, $u_c\in\{0,1\}$ with $\sum_{d,r}\text{pr}_{cdr}+u_c=1$.
   \vfill
@@ -257,11 +263,13 @@
     \;+\;
     \underbrace{\sum_{c:\,dd_c < 0}\ \sum_{d,r} \big[dd_c + \alpha d\big]\, \text{pr}_{cdr}}_{\text{overdue, urgency mult. }\alpha}
     \;+\;
-    \underbrace{\sum_{c:\,p_c \ne 4} p_c\, w_c\, u_c}_{\text{non-scheduling penalty}}
+    \underbrace{\sum_{c:\,p_c \ne 4} w_c\, u_c}_{\text{non-scheduling penalty}}
+    \;+\;
+    \underbrace{\pi^{\text{ovf}}\!\!\sum_{c:\rho(c)\ne\text{none}} \text{overflow}_c}_{\text{bed-horizon overflow}}
   \]
   \[
-    w_c = \text{PenaltyCurve}\big(dd_c \cdot \mu_{p_c}\big) + 1.2 \cdot \max_{c'\in C} dd_{c'}
-    \quad \text{(calibrated to dominate Terms 1--2)}
+    w_c = \mu_{p_c} \cdot \text{PenaltyCurve}(dd_c) + 1.2 \cdot \max_{c'\in C} dd_{c'}
+    \quad \text{-- multiplier on the curve's \emph{output}, applied once (corrected)}
   \]
 \end{frame}
 
@@ -286,26 +294,32 @@
 \begin{frame}{Constraints II -- Capacity \& Shared Resources}
   \footnotesize
   \textbf{C7 -- room capacity, exact:} $\texttt{AddNoOverlap}(\{\text{iv}_{cdr}: d,r
-  \text{ fixed}\})$.\quad
+  \text{ fixed}\})$ -- the \textbf{room} interval ($t_c^{\text{tot}}$).\quad
   \textbf{C8 -- surgeon, exact + daily cap:}
-  $\texttt{AddNoOverlap}(\{\text{iv}_{cdr}:\text{surgeon}(c)=h, d \text{ fixed}\})$
-  \emph{plus} $\sum_{c} t_c^{\text{op}}\text{pr}_{cdr} \le k_{hd}$.\quad
+  $\texttt{AddNoOverlap}(\{\textbf{sgiv}_{cdr}:\text{surgeon}(c)=h, d \text{ fixed}\})$
+  -- the \textbf{surgeon}'s own interval ($t_c^{\text{op}}$, \emph{corrected}, see
+  Corrections section) \emph{plus} $\sum_{c} t_c^{\text{op}}\text{pr}_{cdr} \le k_{hd}$.\quad
   \textbf{C9 -- surgeon weekly limit:} $\sum_{d,r} t_c^{\text{op}}\text{pr}_{cdr} \le k_h$.
   \vfill
-  \textbf{C10 -- shared equipment, exact concurrency:}
+  \textbf{C10 -- shared equipment, exact concurrency} (room interval):
   \[
     \texttt{AddCumulative}\big(\{\text{iv}_{cdr}: u_{c,e}=1, d \text{ fixed}\},\,
     \text{demands}=1,\, \text{capacity}=\kappa_{ed}\big)
   \]
-  \textbf{C11 -- downstream recovery/ICU beds:}
+  \textbf{C11 -- downstream recovery/ICU beds, now with an overflow penalty:}
   \[
     \text{bed}_c=\texttt{NewOptionalIntervalVar}(\text{dayof}_c,\,\text{los}_c,\,
     \text{dayof}_c+\text{los}_c,\,\text{is\_scheduled}_c),\quad
     \texttt{AddCumulative}(\{\text{bed}_c:\rho(c)=\rho\},\,1,\,\beta_\rho)
   \]
+  \[
+    \text{overflow}_c = \max(0,\ (\text{dayof}_c+\text{los}_c) - n_{\text{days}}) \quad
+    \text{-- charged in the objective, not silently ignored}
+  \]
   \vfill
-  \textit{C7--C11 share one interval per candidate slot -- a case's start propagates
-  across every resource it touches without an explicit channeling constraint.}
+  \textit{C7, C10, C11 use the room interval; C8 uses the surgeon interval -- both
+  share one \texttt{start} per candidate slot, so a case's timing propagates across
+  every resource it touches without an explicit channeling constraint.}
 \end{frame}
 
 \begin{frame}{Alternative Formulations Considered}
@@ -322,6 +336,125 @@
   only as a graceful fallback to the MILP above today, with setup instructions printed
   at runtime. Pointed at as the natural backend for very large instances or real-time
   re-optimization, not benchmarked here.
+\end{frame}
+
+% ============================================================================
+\section{Corrections Found During Review}
+% ============================================================================
+
+\begin{frame}{Correction 1: Priority/Penalty Double-Counting}
+  \footnotesize \textbf{Bug:} the curve's \emph{input} was scaled by the priority
+  multiplier ($\text{curve}(dd_c\cdot\mu_{p_c})$), and \emph{every} solver's objective
+  \emph{also} multiplied the result by $p_c$ again -- two independent applications of
+  priority, compounding.
+  \vfill
+  \begin{table}
+    \centering\tiny
+    \begin{tabular}{lcccccc}
+      \toprule
+      Case & $p_c$ ($\mu_{p_c}$) & $dd_c$ & Old input & Old output & \textbf{Old $\times p_c$} & \textbf{New: $\mu_{p_c}\times$curve($dd_c$)} \\
+      \midrule
+      A & 4 (90) & $-1$ & $-90$ & 2900 & \textbf{11{,}600} & \textbf{90{,}000} \\
+      B & 1 (1) & $-90$ & $-90$ & 2900 & \textbf{2{,}900} & \textbf{2{,}900} \\
+      C & 1 (1) & $-100$ & $-100$ & 3100 & \textbf{3{,}100} & \textbf{3{,}100} \\
+      \bottomrule
+    \end{tabular}
+  \end{table}
+  \vfill
+  \textbf{Old:} Case A (1 day overdue, top priority) scored \emph{below} 4$\times$ what
+  the curve alone specified, and -- worse -- only 3.7$\times$ Case C, even though Case C
+  is 100$\times$ more overdue at the lowest priority: a real monotonicity inversion.
+  \textbf{New:} multiplier applied once, to the curve's output, on the \emph{real}
+  $dd_c$ -- ordering restored, double-count removed. Full derivation: FORMULATION\_CP.md \S6.1.
+\end{frame}
+
+\begin{frame}{Correction 2: Surgeon Interval Conflated With Room Interval}
+  \footnotesize \textbf{Bug:} C8's \texttt{NoOverlap} was declared over the
+  \textbf{room} interval (size $t_c^{\text{tot}}$, includes cleaning), not a
+  surgeon-specific one -- so the surgeon was implicitly held ``busy'' through a
+  cleaning buffer they have no involvement in.
+  \vfill
+  \textbf{Worked example:} Surgeon H operates Case X in Room 1, $t_c^{\text{op}}=70$,
+  $t_c^{\text{clean}}=20$, $t_c^{\text{tot}}=90$, starting at $t=0$.
+  \begin{itemize}
+    \item \textbf{Old model:} Case Y (same surgeon) cannot start before $t=90$ in
+      \emph{any} room -- the 20-minute window $[70,90)$, when the surgeon is free but
+      Room 1 is being cleaned, was wrongly forbidden.
+    \item \textbf{New model:} a second interval, $\text{sgiv}_{cdr}$ (size
+      $t_c^{\text{op}}=70$), is used for C8 instead. Case Y can now start at $t=70$ in
+      Room 2 -- the surgeon scrubs into a second room while staff turns over the
+      first, a real, common OR practice this fix restores.
+  \end{itemize}
+  \vfill
+  \footnotesize\textit{Same direction as the central modeling argument (slide:
+  ``Central Modeling Decision'') -- exact resource modeling recovers a legitimate
+  schedule a coarser one forbids, here applied to the surgeon instead of equipment. A
+  regression test (exact surgeon non-overlap, on the surgeon's own window) was added
+  to \texttt{tests/test\_model.py}. Full derivation: FORMULATION\_CP.md \S6.2.}
+\end{frame}
+
+% ============================================================================
+\section{Parameter Justification Audit}
+% ============================================================================
+
+\begin{frame}{Are These Constants Justified? An Honest Audit}
+  \footnotesize
+  \begin{table}
+    \centering\tiny
+    \begin{tabular}{p{2.6cm}p{3.2cm}p{6.0cm}}
+      \toprule
+      Parameter & Status & Honest caveat \\
+      \midrule
+      $t_c^{\text{clean}}=20$ (flat) & Plausible, not procedure-specific & Real turnover
+        varies $\sim$15--60 min by complexity. Flat constant flagged, not changed
+        mid-review (see Appendix B.5) -- changing it mid-flight would invalidate the
+        30-min reference benchmark this same review produced. \\
+      \texttt{daily\_limit} 240/300 & Demo: literature-grounded; medium: scale
+        assumption & 240 = one standard half-day OR block (Cardoen et al., 2010); 300
+        is this case's ``larger hospital'' framing, not a second citation. \\
+      $\alpha=2.0$ & Audited, provably narrow & Appears \emph{only} in Term 2's day
+        coefficient -- cannot change \emph{who} gets scheduled, only \emph{which day}
+        an overdue case lands on (proof: Appendix B.2). \\
+      Displacement $1.2\times\max dd_c$ & Audited, confirmed sufficient & Exact minimum
+        margin is $1+\alpha n_{\text{days}}/\max dd_c \approx 1.037$ here -- so 1.2 was
+        already the conservative-but-correct choice, not an arbitrarily loose one. \\
+      \bottomrule
+    \end{tabular}
+  \end{table}
+  \vfill
+  Full audit, including the ICU-probability parameter and the displacement derivation:
+  FORMULATION.md Appendix B.
+\end{frame}
+
+\begin{frame}{Calibrating Priority Multipliers in Practice}
+  \footnotesize Not by literature lookup -- $\mu_p$ encodes a hospital's own risk
+  tolerance, a policy choice. In practice: structured elicitation with service chiefs,
+  anchored on scenarios (``1 priority-2 patient 30 days over target vs.\ 1 priority-1
+  patient 200 days over theirs -- which is worse, by what factor?''), then validated
+  against a sensitivity sweep.
+  \vfill
+  \textbf{Real sweep run on the 200-case instance}, scaling $\mu_2,\mu_3,\mu_4$ by
+  $k\in\{0.25,0.5,1,2,4\}$ (45s CP-SAT, 2\% gap):
+  \begin{table}
+    \centering\tiny
+    \begin{tabular}{lccccc}
+      \toprule
+      $k$ & 0.25 & 0.5 & \textbf{1.0 (default)} & 2.0 & 4.0 \\
+      \midrule
+      Total scheduled & 130 & 128 & 130 & 128 & 130 \\
+      Overdue scheduled & 56 & 55 & 54 & 52 & 52 \\
+      Routine (P1) scheduled & 64 & 60 & 60 & 57 & 56 \\
+      \bottomrule
+    \end{tabular}
+  \end{table}
+  \vfill
+  \textbf{Counter-intuitive, honest finding:} total scheduled is capacity-bound, not
+  $\mu_p$-bound; overdue-scheduled does \emph{not} monotonically rise with $k$, because
+  $\mu_p$ is keyed to \emph{priority tier}, not \emph{overdue severity} -- it
+  cuts across tiers. \textbf{Equity risk:} a specialty with longer, lower-tier cases
+  (e.g. Neurosurgery, $\sim$261-day avg.\ breach) is \emph{not} helped by a bigger
+  global $\mu_p$ -- the fix is a per-service tracked target or fairness constraint,
+  not a bigger scalar. Full discussion: FORMULATION.md Appendix B.4.
 \end{frame}
 
 % ============================================================================
@@ -347,45 +480,65 @@
   \vfill
   \normalsize\textbf{CP-SAT wins on objective (155 vs.\ 157), not by searching harder,
   but by modeling the shared C-arm correctly:} \texttt{AddCumulative} checks literal
-  time overlap, so it legally places two C-arm cases on Tuesday, in different rooms,
-  at non-overlapping times -- a schedule the MILP's day-count cap forbids outright.
+  time overlap, so it legally places multiple C-arm cases on the same day -- three,
+  sequentially on Monday, in the canonical run shown later -- a placement the MILP's
+  day-count cap forbids outright (it spreads its four C-arm cases one per day across
+  four different days instead). \emph{Which exact arrangement} CP-SAT returns can vary
+  run to run among tied optima -- the structural conclusion does not.
 \end{frame}
 
-\begin{frame}{Results -- Medium Instance (200 cases, 12 rooms, 17 surgeons)}
-  \footnotesize 60-second budget per solver.
+\begin{frame}{Results -- Medium Instance, Step 1: the \emph{true} MILP optimum}
+  \footnotesize Gurobi, near-zero gap, no time pressure:
   \begin{table}
-    \centering\footnotesize
-    \begin{tabular}{lccccc}
+    \centering
+    \begin{tabular}{lcccc}
       \toprule
-      Solver & Status & Objective & Gap & Scheduled & Time \\
+      Solver & Status & Objective & Gap & Time \\
       \midrule
-      Greedy & Feasible & 70{,}883.0 & -- & 124/200 & 0.00s \\
-      \textbf{CP-SAT (primary)} & Feasible & \textbf{41{,}548.0} & 4.30\% & \textbf{130/200} & 60.45s \\
-      OR-Tools/CBC (comparison MILP) & Feasible & 44{,}346.0 & 0.31\% & 128/200 & 60.11s \\
-      Gurobi (comparison MILP) & Feasible & 44{,}333.0 & 0.45\% & 129/200 & 1.65s \\
-      Hexaly ($\to$ CBC fallback) & Feasible & 44{,}346.0 & 0.31\% & 128/200 & 60.13s \\
+      \textbf{Gurobi (true optimum)} & \textbf{Optimal} & \textbf{74{,}305.0} & 0.01\% & \textbf{$\sim$14s} \\
       \bottomrule
     \end{tabular}
   \end{table}
   \vfill
-  \textbf{The demo's effect reproduces, larger, at scale:} CP-SAT's objective is
-  \textbf{6.3\% lower} (41{,}548 vs.\ 44{,}346) while scheduling \textbf{2 more cases},
-  even though its own gap (4.30\%) looks less converged than CBC's (0.31\%).
+  This is the \textbf{proven} optimum of the alternative MILP (130/200 scheduled) --
+  not an approximation. Every number on the next slide is measured against
+  \textbf{74{,}305.0}.
+\end{frame}
+
+\begin{frame}{Results -- Medium Instance, Step 2: 30-minute budget, 1\% gap target}
+  \footnotesize Both backends run independently, in parallel, for 30 minutes each.
+  \begin{table}
+    \centering\footnotesize
+    \begin{tabular}{lcccccc}
+      \toprule
+      Solver & Status & Objective & Own Gap & vs.\ True MILP Opt. & Scheduled & Time \\
+      \midrule
+      OR-Tools/CBC & Feasible & 74{,}383.0 & 0.13\% & $+$0.10\% & 130/200 & 1800.6s \\
+      \textbf{CP-SAT/Interval} & Feasible & \textbf{66{,}471.0} & 1.31\% & \textbf{$-$10.54\%} & \textbf{133/200} & 1801.2s \\
+      \bottomrule
+    \end{tabular}
+  \end{table}
+  \vfill
+  \textbf{CBC} essentially reaches the MILP's true optimum (within 0.10\%) but needs
+  the full 30 minutes. \textbf{CP-SAT finds a legitimately better, 10.54\%-lower-cost
+  schedule the MILP's feasible region cannot contain at all}, while scheduling 3 more
+  cases. Its own 1.31\% gap means even better schedules than 66,471 likely exist.
 \end{frame}
 
 \begin{frame}{Reading This Correctly}
   \footnotesize
   \begin{itemize}
-    \item \textbf{A tighter own-gap is not a better answer.} CBC's 0.31\% gap is tight
+    \item \textbf{A tighter own-gap is not a better answer.} CBC's 0.13\% gap is tight
       because its feasible region is \emph{smaller} -- a day-bucket relaxation that
       structurally excludes schedules CP-SAT can reach. It's easier to prove there's
       nothing better than 5 in $\{1,\ldots,5\}$ than in $\{1,\ldots,100\}$; that doesn't
       make 5 the better answer.
     \item \textbf{Same mechanism at both scales.} The 20-case C-arm story and the
-      200-case 6.3\%/+2-cases result are the same effect: exact temporal/resource
+      200-case 10.5\%/+3-cases result are the same effect: exact temporal/resource
       reasoning recovers schedules a coarser aggregate constraint forbids outright.
     \item \textbf{This is why CP-SAT is the primary deliverable}, with the MILP kept
-      only as the comparison that makes the claim falsifiable and, here, confirmed.
+      only as the comparison that makes the claim falsifiable and, here, confirmed --
+      on a corrected, audited objective formula (Corrections section).
   \end{itemize}
   \vfill
   \begin{table}
@@ -410,16 +563,17 @@
 \begin{frame}{Demo Instance -- Primary CP-SAT Model}
   \centering
   \includegraphics[width=\textwidth]{img/demo_cp_sat.png}
-  \footnotesize Real start/end clock times. Note Tuesday: two C-arm cases, different
-  rooms, non-overlapping times -- the schedule the comparison MILP's equipment cap
-  forbids.
+  \footnotesize Real start/end clock times. Three C-arm cases land on Monday alone,
+  sequentially in one room -- the schedule the comparison MILP's day-count equipment
+  cap forbids outright.
 \end{frame}
 
 \begin{frame}{Demo Instance -- Comparison MILP (OR-Tools/CBC)}
   \centering
   \includegraphics[width=\textwidth]{img/demo_baseline_milp.png}
   \footnotesize Same cases, no exact clock times (the MILP doesn't model any) --
-  cases within a room-day are laid out back-to-back, arbitrary order.
+  its four C-arm cases spread one per day across four different days, exactly as its
+  day-count cap (C10) forces.
 \end{frame}
 
 \begin{frame}{Medium Instance (200 cases) -- Primary CP-SAT Model}
@@ -464,8 +618,8 @@
 \begin{frame}{Q1 -- Passing the Torch}
   \small I'd hand a developer four things, not just the math:
   \begin{enumerate}
-    \item \textbf{FORMULATION.md + \texttt{types.py}} -- the dataclasses
-      \emph{are} the data dictionary; sets/parameters map 1:1 to fields.
+    \item \textbf{FORMULATION.md + FORMULATION\_CP.md + \texttt{types.py}} -- the
+      dataclasses \emph{are} the data dictionary; sets/parameters map 1:1 to fields.
     \item \textbf{The solver code itself} -- every constraint is labeled (C1\ldots C11)
       and the matching code carries the same label. Read side by side, no ambiguity
       about which line implements which formula.
@@ -561,8 +715,8 @@
   \centering
   \Huge Thank You
   \vfill
-  \normalsize Repository: \texttt{FORMULATION.md} $\cdot$
-  \texttt{RESULTS.md} $\cdot$ \texttt{README.md}
+  \normalsize Repository: \texttt{FORMULATION.md} $\cdot$ \texttt{FORMULATION\_CP.md}
+  $\cdot$ \texttt{RESULTS.md} $\cdot$ \texttt{README.md}
   \vfill
   \texttt{python main.py}\quad(primary model)\qquad
   \texttt{python main.py --benchmark}\quad(comparison)

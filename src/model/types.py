@@ -204,6 +204,18 @@ class PlanningInstance:
 
     alpha: float = 2.0                 # α > 1: urgency multiplier for overdue cases
 
+    # Recovery/ICU bed capacity (bed_capacity above) is modeled as constant
+    # across the week (FORMULATION_CP.md C11). A bed stay starting late in
+    # the horizon (e.g. Friday, 2-day length of stay) can extend past the
+    # modeled week — into what would be a weekend, typically lower-staffed
+    # in real hospitals, a regime this constant-capacity model does not
+    # represent. Rather than silently ignore that, every day of a stay
+    # falling on/after the horizon's last day is charged this penalty in
+    # the objective (0 = no penalty, i.e. the old, silent behaviour). This
+    # is an explicit POLICY KNOB, not a literature-derived constant — see
+    # FORMULATION.md's parameter-justification appendix.
+    weekend_bed_overflow_penalty: float = 50.0
+
     def __post_init__(self):
         self._validate()
 

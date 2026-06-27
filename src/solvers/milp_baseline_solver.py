@@ -141,7 +141,9 @@ class MILPBaselineSolver(BaseSolver):
             for (cid, d, rid), var in x.items()
         ]
         objective_terms += [
-            c.priority.value * penalties[c.id] * z[c.id]
+            # penalties[c.id] already includes the priority multiplier
+            # (penalty.py) — no extra priority.value factor here.
+            penalties[c.id] * z[c.id]
             for c in cases if c.id in z
         ]
         solver.Minimize(solver.Sum(objective_terms))
@@ -280,7 +282,8 @@ class MILPBaselineSolver(BaseSolver):
             m.setObjective(
                 gp.quicksum(_objective_coeff(instance, case_map[cid], d) * var
                             for (cid, d, rid), var in x.items())
-                + gp.quicksum(c.priority.value * penalties[c.id] * z[c.id]
+                # penalties[c.id] already includes the priority multiplier.
+                + gp.quicksum(penalties[c.id] * z[c.id]
                               for c in cases if c.id in z),
                 GRB.MINIMIZE,
             )

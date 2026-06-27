@@ -8,10 +8,13 @@
 > **Hexaly** is wired up as an optional, license-gated extension for very large/real-time
 > instances — not part of the core deliverable.
 
-Read **[FORMULATION.md](FORMULATION.md)** for the full model (sets, parameters,
-variables, objective, constraints, assumptions, and why CP over MIP), then
-**[RESULTS.md](RESULTS.md)** for what the demo produces and why it validates that
-choice.
+Read **[FORMULATION.md](FORMULATION.md)** first (problem framing, evidence, why CP over
+MIP, assumptions, shared sets/parameters, and two appendices — the MIP in full detail,
+and a parameter-justification audit), then **[FORMULATION_CP.md](FORMULATION_CP.md)**
+(the CP-SAT model's full variables/objective/constraints math, including two
+corrections found and fixed during review — documented with worked numeric examples,
+not just asserted), then **[RESULTS.md](RESULTS.md)** for what the demo produces and
+why it validates the CP-over-MIP choice.
 
 ---
 
@@ -53,7 +56,10 @@ python tests/test_model.py
 ```
 or-surgery-scheduling/
 ├── main.py                       # CLI entry point + optional comparison mode
-├── FORMULATION.md                # The model: sets, params, variables, objective, constraints, why CP not MIP
+├── FORMULATION.md                # Master doc: problem, evidence, why CP, assumptions, shared sets/params
+│                                  #   + Appendix A (MIP in detail) + Appendix B (parameter justification audit)
+├── FORMULATION_CP.md             # Full CP-SAT math (variables/objective/constraints C1-C11)
+│                                  #   + two corrections found during review, with worked numeric examples
 ├── RESULTS.md                    # Demo results + the CP-vs-MIP comparison that validates the choice
 ├── README.md                     # This file
 ├── requirements.txt
@@ -114,7 +120,11 @@ disjunctive resource-constrained scheduling — exactly the structure `NoOverlap
 disjunctive encoding. FORMULATION.md §3 makes the full argument; RESULTS.md shows it
 empirically against a comparison MILP.
 
-Full math, assumptions, and what's deliberately left out: **FORMULATION.md**.
+Full math, assumptions, and what's deliberately left out: **FORMULATION.md** (problem,
+evidence, why-CP argument, assumptions) and **FORMULATION_CP.md** (the CP model's
+complete variables/objective/constraints, plus two corrections — a priority/penalty
+double-counting bug and a surgeon/room interval-sizing bug — found and fixed during
+review, each documented with a worked numeric example).
 
 ---
 
@@ -131,22 +141,28 @@ Full discussion in **[RESULTS.md](RESULTS.md)**. Headline:
 
 CP-SAT finds a *better* schedule, not by searching harder, but by modeling the shared
 C-arm correctly: it checks literal time overlap (`AddCumulative`) instead of a
-day-count cap, and so legally places two C-arm cases on the same day, in different
-rooms, at non-overlapping times — a schedule the MILP's coarser constraint forbids
-outright.
+day-count cap, and so legally places multiple C-arm cases on the same day — in the
+canonical run captured for the plot below, three of them, sequentially, on Monday — a
+placement the MILP's coarser constraint forbids outright (RESULTS.md has the honest
+caveat about which *exact* arrangement varies run to run among CP-SAT's tied optima;
+the structural conclusion doesn't).
 
-### Medium instance (200 cases, 12 rooms, 17 surgeons), 60-second budget
+### Medium instance (200 cases, 12 rooms, 17 surgeons), 30-minute / 1% gap budget
 
-| Solver | Status | Objective | Gap | Scheduled | Time |
-|---|---|---|---|---|---|
-| **CP-SAT (primary model)** | Feasible | **41,548.0** | 4.30% | **130/200** | 60.45s |
-| OR-Tools/CBC (comparison MILP) | Feasible | 44,346.0 | 0.31% | 128/200 | 60.11s |
+True optimum of the alternative MILP (Gurobi, near-zero gap, ~14s): **74,305.0**,
+130/200 scheduled. Both backends then given 30 minutes at a 1% gap target:
 
-The same effect, larger: CP-SAT's objective is **6.3% lower** while scheduling **2 more
-cases** — because it searches a strictly larger, correct feasible region, not because
-its own convergence is tighter (it isn't: 4.30% vs. 0.31%). A smaller feasible region is
-easier to fully close; that's not the same as being a better answer. RESULTS.md spells
-this out in full, including the honest "Optimal ≠ 0% gap" caveat for both backends.
+| Solver | Status | Objective | Own Gap | vs. True MILP Optimum | Scheduled | Time |
+|---|---|---|---|---|---|---|
+| OR-Tools/CBC | Feasible | 74,383.0 | 0.13% | +0.10% | 130/200 | 1800.6s |
+| **CP-SAT (primary model)** | Feasible | **66,471.0** | 1.31% | **−10.54%** | **133/200** | 1801.2s |
+
+CP-SAT's objective is **10.5% below the MILP's proven optimum** while scheduling
+**3 more cases** — because it searches a strictly larger, correct feasible region, not
+because its own convergence is tighter (it isn't: 1.31% vs. CBC's 0.13%). A smaller
+feasible region is easier to fully close; that's not the same as being a better answer.
+RESULTS.md spells this out in full, including the honest "Optimal ≠ 0% gap" caveat for
+both backends.
 
 ---
 
@@ -157,9 +173,10 @@ plenty." Generated with `python main.py --instance <name> --solver cp-sat --plot
 out.png` (see `src/utils/visualizer.py`). Each bar is one case; outlined bars are
 priority-4 (locked to day 1); colors are surgical service.
 
-**Demo instance, primary CP-SAT model** — real start/end clock times; note Tuesday's
-two different C-arm cases, different rooms, non-overlapping times — the schedule the
-comparison MILP's day-count equipment cap forbids:
+**Demo instance, primary CP-SAT model** — real start/end clock times; three C-arm cases
+land on Monday alone, sequentially in one room — the schedule the comparison MILP's
+day-count equipment cap forbids outright (it spreads its four C-arm cases one per day
+across four different days instead — see the demo-instance plot below):
 
 ![Demo instance, CP-SAT interval-based](docs/img/demo_cp_sat.png)
 
@@ -202,10 +219,11 @@ brief's own "small demo" framing).
 
 ### 1. Passing the Torch
 
-I'd hand a developer four things: **(1)** FORMULATION.md alongside `src/model/types.py`
-— the dataclasses are the data dictionary, one source of truth. **(2)** the solver code
-itself, where every constraint is labeled (C1…C11) and the matching code carries the
-same label, so reading them side by side leaves no ambiguity. **(3)**
+I'd hand a developer four things: **(1)** FORMULATION.md and FORMULATION_CP.md alongside
+`src/model/types.py` — the dataclasses are the data dictionary, one source of truth.
+**(2)** the solver code itself, where every constraint is labeled (C1…C11) and the
+matching code carries the same label, so reading them side by side leaves no ambiguity.
+**(3)**
 `tests/test_model.py` as the acceptance contract — any reimplementation must pass the
 same hard-constraint checks on the same demo instance. **(4)** a short glossary of the
 handful of domain terms that aren't self-explanatory (room roster, ambulatory, priority

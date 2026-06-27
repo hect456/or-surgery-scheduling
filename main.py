@@ -2,9 +2,10 @@
 """
 main.py — Demo runner for Elective Surgery Scheduling.
 
-The primary model is the interval-based CP-SAT solver (FORMULATION.md). The
-MILP and Hexaly backends are optional comparison/extension points
-(FORMULATION.md §12) — useful for `--benchmark`, not required to see the
+The primary model is the interval-based CP-SAT solver (FORMULATION_CP.md has
+the full math; FORMULATION.md §3 argues why CP over MIP). The MILP and
+Hexaly backends are optional comparison/extension points (FORMULATION.md
+§12, Appendix A) — useful for `--benchmark`, not required to see the
 primary model run.
 
 Usage

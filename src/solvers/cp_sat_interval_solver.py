@@ -1,9 +1,12 @@
 """
 cp_sat_interval_solver.py — Interval-Based Constraint Programming model,
 solved with Google OR-Tools CP-SAT. This is the PRIMARY formulation —
-see FORMULATION.md, sections 3 (why CP, not MILP), 7-9 (variables,
-objective, constraints C1-C11). Every constraint below carries the same
-C-number as FORMULATION.md §9, so the two can be read side by side.
+see FORMULATION.md §3 for why CP, not MILP, and FORMULATION_CP.md for the
+full variables/objective/constraints (C1-C11) math, including the two
+corrections documented in FORMULATION_CP.md §6 (priority/penalty-curve
+double-counting; surgeon vs. room interval size). Every constraint below
+carries the same C-number as FORMULATION_CP.md, so the two can be read
+side by side.
 
 Why interval-based CP-SAT (FORMULATION.md §3, condensed)?
 -----------------------------------------------------------
@@ -41,10 +44,18 @@ class CPSATIntervalSolver(BaseSolver):
     Variables (per feasible case/day/room slot, same eligibility filter as
     the baseline: room-service match, ambulatory-only, pediatric block,
     surgeon availability):
-      presence[c,d,r] : bool — case c assigned to (d, r)
-      start[c,d,r]    : int  — start time in minutes from room opening
-      end[c,d,r]      : int  — end time (= start + t_tot when present)
-      interval[c,d,r] : optional interval, present iff presence[c,d,r]
+      presence[c,d,r]        : bool — case c assigned to (d, r)
+      start[c,d,r]           : int  — start time in minutes from room opening
+      end[c,d,r]             : int  — room-end (= start + t_tot when present)
+      interval[c,d,r]        : optional interval [start, start+t_tot) —
+                                ROOM occupancy (operative + cleaning time)
+      surgeon_end[c,d,r]     : int  — surgeon-end (= start + t_cir)
+      surgeon_interval[c,d,r]: optional interval [start, start+t_cir) —
+                                the SURGEON's own time in the case, used
+                                for the surgeon NoOverlap (C8) so the
+                                surgeon can start a case in a different
+                                room while this room is still being
+                                cleaned — see C8 in FORMULATION_CP.md
 
     unscheduled[c] : bool — case c not scheduled (non-emergent cases only)
     day_of[c]      : int  — day index of c's surgery (only built for cases
@@ -87,10 +98,25 @@ class CPSATIntervalSolver(BaseSolver):
                     candidates.append((c.id, d, r.id))
 
         # ── Interval variables ───────────────────────────────────────────
+        # Two intervals per candidate slot, sharing the same start time but
+        # different sizes — NOT one interval reused for both room and
+        # surgeon constraints:
+        #   interval[key]          : [start, start + t_tot)  — room occupancy
+        #                             (operative time + cleaning/turnover)
+        #   surgeon_interval[key]  : [start, start + t_cir)  — surgeon's own
+        #                             time in the case (no cleaning)
+        # Reusing the t_tot-sized interval for the surgeon's NoOverlap too
+        # (an earlier version did this) silently forbids a real, legitimate
+        # schedule: the surgeon scrubbing into a *different* room while
+        # this room is still being cleaned by nursing/support staff. Only
+        # the room itself needs to stay blocked for t_tot; the surgeon is
+        # free again after t_cir. See FORMULATION_CP.md C8 for the math.
         presence: Dict[Tuple[str, str, str], object] = {}
         start: Dict[Tuple[str, str, str], object] = {}
         end: Dict[Tuple[str, str, str], object] = {}
         interval: Dict[Tuple[str, str, str], object] = {}
+        surgeon_end: Dict[Tuple[str, str, str], object] = {}
+        surgeon_interval: Dict[Tuple[str, str, str], object] = {}
         room_caps = {r.id: r.capacity_min for r in rooms}
 
         for (cid, d, rid) in candidates:
@@ -102,6 +128,10 @@ class CPSATIntervalSolver(BaseSolver):
             end[key] = model.NewIntVar(0, max(cap, 0), f"en_{cid}_{d}_{rid}")
             interval[key] = model.NewOptionalIntervalVar(
                 start[key], c.t_tot, end[key], presence[key], f"iv_{cid}_{d}_{rid}"
+            )
+            surgeon_end[key] = model.NewIntVar(0, max(cap, 0), f"sgend_{cid}_{d}_{rid}")
+            surgeon_interval[key] = model.NewOptionalIntervalVar(
+                start[key], c.t_cir, surgeon_end[key], presence[key], f"sgiv_{cid}_{d}_{rid}"
             )
 
         # ── is_scheduled / unscheduled bookkeeping ───────────────────────
@@ -151,11 +181,14 @@ class CPSATIntervalSolver(BaseSolver):
             if len(ivs) > 1:
                 model.AddNoOverlap(ivs)
 
-        # ── C8: surgeon — exact NoOverlap (no double-booking) + daily cap ─
+        # ── C8: surgeon — exact NoOverlap on the SURGEON's own interval
+        # (size t_cir, not the room's t_tot) + daily cap. Using the
+        # surgeon-only interval is what lets the surgeon move to a
+        # different room while this room is still being cleaned.
         by_surgeon_day: Dict[Tuple[str, str], list] = defaultdict(list)
         for k in candidates:
             cid, d, rid = k
-            by_surgeon_day[case_map[cid].surgeon_id, d].append(interval[k])
+            by_surgeon_day[case_map[cid].surgeon_id, d].append(surgeon_interval[k])
         for ivs in by_surgeon_day.values():
             if len(ivs) > 1:
                 model.AddNoOverlap(ivs)
@@ -190,15 +223,9 @@ class CPSATIntervalSolver(BaseSolver):
                     if ivs:
                         model.AddCumulative(ivs, [1] * len(ivs), cap)
 
-        # ── C11: downstream recovery/ICU bed AddCumulative ───────────────
-        # Day-granularity resource: a case occupies a bed from its surgery
-        # day for `recovery_los_days` days. Not expressible in the
-        # alternative day-bucket MILP (FORMULATION.md §12) — needs an
-        # interval representation to even state correctly.
-        if instance.has_bed_limits():
-            self._add_recovery_bed_constraints(model, instance, candidates, presence, is_scheduled)
-
-        # ── Objective: identical three-term formula, over `presence` ────
+        # ── Objective, part 1/2: the three-term tardiness formula, over
+        # `presence` (built first so C11 below can append its overflow
+        # penalty term to the same list) ─────────────────────────────────
         objective_terms = []
         for c in cases:
             dtd = instance.days_to_deadline(c)
@@ -211,8 +238,22 @@ class CPSATIntervalSolver(BaseSolver):
                     coeff = (dtd + d_val) if dtd >= 0 else (dtd + alpha * d_val)
                     objective_terms.append(int(round(coeff)) * presence[key])
         for cid, u in unscheduled.items():
-            c = case_map[cid]
-            objective_terms.append(int(round(c.priority.value * penalties[cid])) * u)
+            # penalties[cid] already includes the priority multiplier
+            # (penalty.py) — do not multiply by priority.value again here
+            # (that was a double-counting bug; see penalty.py docstring).
+            objective_terms.append(int(round(penalties[cid])) * u)
+
+        # ── C11: downstream recovery/ICU bed AddCumulative ───────────────
+        # Day-granularity resource: a case occupies a bed from its surgery
+        # day for `recovery_los_days` days. Not expressible in the
+        # alternative day-bucket MILP (FORMULATION.md §12) — needs an
+        # interval representation to even state correctly. Also appends
+        # the weekend-overflow penalty (see PlanningInstance docstring) to
+        # objective_terms for any stay extending past the horizon.
+        if instance.has_bed_limits():
+            self._add_recovery_bed_constraints(
+                model, instance, candidates, presence, is_scheduled, objective_terms
+            )
         model.Minimize(sum(objective_terms))
 
         # ── Warm start: seed CP-SAT's portfolio search with the greedy
@@ -298,10 +339,11 @@ class CPSATIntervalSolver(BaseSolver):
         )
 
     @staticmethod
-    def _add_recovery_bed_constraints(model, instance, candidates, presence, is_scheduled):
+    def _add_recovery_bed_constraints(model, instance, candidates, presence, is_scheduled,
+                                       objective_terms):
         days = instance.days
-        case_map = instance.cases_by_id
         n_days = len(days)
+        overflow_penalty = int(round(instance.weekend_bed_overflow_penalty))
 
         beds_by_type: Dict[str, list] = defaultdict(list)
         for c in instance.cases:
@@ -323,6 +365,23 @@ class CPSATIntervalSolver(BaseSolver):
                 bed_start, c.recovery_los_days, bed_end, f"bed_{c.id}"
             )
             beds_by_type[c.recovery_type].append(bed_iv)
+
+            # Horizon-boundary handling (see PlanningInstance.
+            # weekend_bed_overflow_penalty docstring): bed_capacity is
+            # constant across the week, but a stay starting late in the
+            # horizon can run past day index n_days-1 (Friday) into what
+            # would be the weekend — a regime this model doesn't have a
+            # separate, lower capacity for. Rather than silently approximate
+            # it, charge each overflow day in the objective instead of
+            # forbidding or ignoring it.
+            if overflow_penalty > 0:
+                # bed_end is the EXCLUSIVE end of [bed_start, bed_end); day
+                # indices 0..n_days-1 are inside the modeled week, so the
+                # number of days at/after index n_days (the first
+                # unmodeled, weekend-like day) is max(0, bed_end - n_days).
+                overflow = model.NewIntVar(0, c.recovery_los_days, f"bedoverflow_{c.id}")
+                model.AddMaxEquality(overflow, [0, bed_end - n_days])
+                objective_terms.append(overflow_penalty * overflow)
 
         for rtype, ivs in beds_by_type.items():
             caps = [cap for (t, d), cap in instance.bed_capacity.items() if t == rtype]

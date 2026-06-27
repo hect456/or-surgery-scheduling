@@ -187,7 +187,8 @@ class HexalySolver(BaseSolver):
                     any_slot = m.or_(*[m.contains(S[k], ci) for k in S])
                     not_scheduled = m.not_(any_slot)
                     scheduled_indicator[c.id] = not_scheduled
-                    obj_terms.append(c.priority.value * penalties[c.id] * not_scheduled)
+                    # penalties[c.id] already includes the priority multiplier.
+                    obj_terms.append(penalties[c.id] * not_scheduled)
 
             m.minimize(m.sum(obj_terms))
             m.close()

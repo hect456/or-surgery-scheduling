@@ -61,6 +61,22 @@ def _assert_hard_constraints(inst, result):
     for hid, ld in week_load.items():
         assert ld <= surg_map[hid].weekly_limit_min, f"Surgeon {hid}: {ld} > weekly limit"
 
+    # Exact surgeon non-overlap, on the SURGEON's own window (t_cir), not
+    # the room's (t_tot) — the two are deliberately different sizes (C8,
+    # FORMULATION_CP.md): the surgeon's own interval excludes the room's
+    # cleaning buffer, so checking against room start/end here would wrongly
+    # flag a legitimate room-cleaning-overlap as a surgeon double-booking.
+    has_times = any(a.start_min is not None for a in result.assignments)
+    if has_times:
+        by_surgeon_day = defaultdict(list)
+        for a in result.assignments:
+            c = case_map[a.case_id]
+            by_surgeon_day[c.surgeon_id, a.day].append((a.start_min, a.start_min + c.t_cir))
+        for (hid, d), spans in by_surgeon_day.items():
+            spans.sort()
+            for (s1, e1), (s2, e2) in zip(spans, spans[1:]):
+                assert e1 <= s2, f"Surgeon {hid} on {d}: overlapping cases ({s1}-{e1}, {s2}-{e2})"
+
     if inst.has_equipment_limits():
         has_times = any(a.start_min is not None for a in result.assignments)
         if has_times:
