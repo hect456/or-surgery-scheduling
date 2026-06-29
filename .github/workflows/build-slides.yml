@@ -1,0 +1,38 @@
+name: Build interview slides
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/or_surgery_scheduling_beamer.tex"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile LaTeX (latexmk, runs pdflatex as many times as needed)
+        uses: xu-cheng/latex-action@v3
+        with:
+          root_file: or_surgery_scheduling_beamer.tex
+          working_directory: docs
+
+      - name: Upload PDF as a build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: or_surgery_scheduling_beamer
+          path: docs/or_surgery_scheduling_beamer.pdf
+
+      - name: Commit the compiled PDF back to the repo
+        if: github.event_name == 'push'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/or_surgery_scheduling_beamer.pdf
+          git diff --staged --quiet || git commit -m "Auto-build interview slides PDF [skip ci]"
+          git push

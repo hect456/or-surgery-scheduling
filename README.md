@@ -174,3 +174,19 @@ defaulted to whichever backend the team knows best.
 See [FORMULATION.md §15](FORMULATION.md#15-references) for the full list (Cardoen et
 al. 2010; Marques & Captivo 2015; Denton et al. 2010; SIGIC; Akbarzadeh & Maenhout 2023;
 Vilím 2004; Schutt et al. 2009; OR-Tools CP-SAT documentation).
+
+---
+
+## Interview deck
+
+`docs/or_surgery_scheduling_beamer.tex` is a Beamer slide deck mirroring this README/
+FORMULATION.md, with the full math (CP-SAT and the comparison MIP) pushed into clickable
+backup slides rather than the main walkthrough path.
+
+It's compiled automatically by `.github/workflows/build-slides.yml`: on every push to
+`main` that touches the `.tex` file (or a manual run from the Actions tab), GitHub
+Actions runs `latexmk` in a TeX Live container, uploads the PDF as a downloadable build
+artifact, and commits it back to `docs/or_surgery_scheduling_beamer.pdf` so the compiled
+slides are always sitting in the repo, no local LaTeX install needed. To compile it
+yourself instead: `pdflatex or_surgery_scheduling_beamer.tex` (run twice, from inside
+`docs/`), or upload the file plus `img/` to Overleaf.
