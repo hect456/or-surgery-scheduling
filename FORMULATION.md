@@ -157,7 +157,7 @@ elective waiting lists:
 Every number attached to this mechanism — maximum wait per tier, the priority
 multipliers, the penalty curve — is a field on `PlanningInstance`
 (`src/model/types.py`), not a constant buried in solver code. A hospital adopting this
-plugs in its own policy without touching the model; §5 below explains exactly how those
+plugs in its own policy without touching the model; §6 below explains exactly how those
 defaults were chosen and what a real deployment should replace.
 
 ## 4. Why constraint programming, not a bigger MILP
