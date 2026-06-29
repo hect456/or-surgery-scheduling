@@ -129,7 +129,7 @@ shared-equipment concurrency, and a downstream recovery/ICU-bed constraint.
 
 **Why CP-SAT, not a bigger MILP:** the problem is disjunctive resource-constrained
 scheduling — exactly the structure `NoOverlap`/`Cumulative` exist for, with
-polynomial-time propagation instead of a big-M disjunctive encoding. FORMULATION.md §3
+polynomial-time propagation instead of a big-M disjunctive encoding. FORMULATION.md §4
 makes the full argument; RESULTS.md checks it empirically.
 
 ---
@@ -153,13 +153,13 @@ cases land where and why the comparison MILP can't reach that schedule at all.
 
 ## Open questions
 
-**Passing this off to a developer.** FORMULATION.md §12 has the full answer; short
+**Passing this off to a developer.** FORMULATION.md §14 has the full answer; short
 version: this file plus the data dictionary in `src/model/types.py`, the solver code
 with matching C-numbered comments, `tests/test_model.py` as the acceptance bar, and a
 short glossary of the few domain terms that aren't self-explanatory — most
 miscommunication on a project like this turns out to be vocabulary, not math.
 
-**A reusable library of models.** FORMULATION.md §13 has the full answer; short
+**A reusable library of models.** FORMULATION.md §14 has the full answer; short
 version: solver-agnostic data types at the bottom, a shared layer of reusable
 constraint patterns (capacity sums, NoOverlap-based non-overlap, tiered-priority
 tardiness, eligibility pre-filters), problem templates that compose those patterns, and
@@ -171,6 +171,6 @@ defaulted to whichever backend the team knows best.
 
 ## References
 
-See [FORMULATION.md §14](FORMULATION.md#14-references) for the full list (Cardoen et
+See [FORMULATION.md §15](FORMULATION.md#15-references) for the full list (Cardoen et
 al. 2010; Marques & Captivo 2015; Denton et al. 2010; SIGIC; Akbarzadeh & Maenhout 2023;
 Vilím 2004; Schutt et al. 2009; OR-Tools CP-SAT documentation).

@@ -8,7 +8,7 @@ same C-number as the comment next to it in the solver, so the two read side by s
 
 ## 1. Sets and parameters
 
-Unchanged from FORMULATION.md §4: $C, D, R, H, E$ and every $t_c^{op}, t_c^{clean},
+Unchanged from FORMULATION.md §5: $C, D, R, H, E$ and every $t_c^{op}, t_c^{clean},
 t_c^{tot}, k_{dr}, k_{hd}, k_h, p_c, dd_c, \mu_p, w_c, \alpha, u_{ce}, \kappa_{ed}$, plus
 the bed-pool parameters $\rho(c), \text{los}_c, \beta_\rho, \pi^{ovf}$ — these last four
 only exist in this model; a day-bucket formulation has no value that means "day of
@@ -111,7 +111,7 @@ $$\texttt{AddCumulative}\big(\{\text{iv}_{cdr} : u_{ce}=1,\,d\text{ fixed}\},\,\
 
 Declared over the room interval, since the equipment sits in the room for the full
 $t_c^{tot}$, cleaning included — unlike the surgeon, it doesn't leave early. This checks
-literal time overlap rather than a day-count, which is the constraint FORMULATION.md §3
+literal time overlap rather than a day-count, which is the constraint FORMULATION.md §4
 argues for and RESULTS.md measures.
 
 **C11 — recovery/ICU beds, with an explicit horizon-overflow term.** For each case $c$
@@ -148,7 +148,7 @@ two different `end`s for the two different resources that slot touches.
 
 CP-SAT runs with its default parallel portfolio (`num_search_workers`, capped at the
 machine's core count) and a relative gap target rather than a hand-written branching
-strategy — see FORMULATION.md §3 for why that's the right default here rather than a
+strategy — see FORMULATION.md §4 for why that's the right default here rather than a
 shortcut. The reported gap is always the genuine bound-vs-incumbent gap, computed even
 when the status is `Optimal`: with a relative gap target set, CP-SAT's `Optimal` means
 "proven within that tolerance," the same convention Gurobi uses, not necessarily a

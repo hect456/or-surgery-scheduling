@@ -2,43 +2,139 @@
 
 **Author:** Hector Bonilla
 
-## 1. The problem, scoped down
+## 1. Problem context
 
-A hospital group wants a weekly plan for its elective (planned) surgical cases: which
-procedure runs in which operating room, at what time, on which day, and with which
-surgeon, over a one-week horizon at a single hospital. The waiting list is always
-bigger than the week's capacity, so part of the decision is which cases run this week
-and which wait — and that choice has to respect clinical urgency, not just convenience.
+A hospital group runs a waiting list of elective (planned) surgical cases that is
+always longer than what one week of operating-room time can absorb. Every week, someone
+has to decide which of those cases actually run — in which room, at what time, on which
+day, with which surgeon — and that decision has to satisfy two things at once: it has to
+be *feasible* (rooms, surgeons, and the handful of shared resources a hospital has are
+all finite), and it has to be *fair* in a clinical sense, so that a patient with a
+genuinely urgent condition doesn't sit behind a routine case just because the routine
+case happened to reach the top of a first-in-first-out queue first.
 
-The brief explicitly invites simplification, so here is what this model keeps and what
-it leaves out, and why.
+This is a real, well-studied operational problem, not a toy one. A few things make it
+worth getting right rather than improvising room-by-room:
 
-**Kept:** case-to-room-to-time assignment, surgeon availability and workload limits,
-room/service rosters (a room is staffed and equipped for one specialty per day), a
-shared piece of equipment (the kind of bottleneck a mobile imaging unit creates), and a
-downstream bed constraint (recovery/ICU beds, which a multi-day stay actually needs an
-interval to express correctly — more on that below).
+- **Operating-room time is expensive and inflexible.** A widely cited cost estimate puts
+  one minute of OR time at roughly $30–40 in a U.S. hospital, once staffing, equipment,
+  and overhead are amortized (Macario, 2010) — and unlike most other hospital capacity,
+  an OR-minute that goes unused today cannot be banked for tomorrow. A schedule that
+  leaves rooms idle, or that forces overtime to absorb a case that didn't fit, is a real
+  cost, not a rounding error.
+- **The waiting list itself is the thing patients and regulators watch.** Public health
+  systems that run large elective waiting lists publish breach statistics because that's
+  the number that gets audited. Marques & Captivo (2015) report that, in one Portuguese
+  hospital's 2016 audit, 16% of roughly 7,400 waiting patients had already passed their
+  clinically-defined deadline, by 147 days on average — a planner who only optimizes
+  total throughput, with no notion of deadline, can hit a good throughput number while
+  quietly failing exactly the patients the system is supposed to protect.
+- **Cardoen, Demeulemeester & Beliën's (2010) literature review** — the standard survey
+  for this problem family — frames "advance scheduling" (deciding which cases run on
+  which day, ahead of the day itself) as a distinct sub-problem precisely because it's
+  where the case-selection and fairness trade-offs above actually get made; the
+  finer-grained "allocation" and "monitoring" sub-problems they describe (exact intraday
+  sequencing, same-day disruption) build on top of an advance schedule rather than
+  replacing it.
+- **Elective and emergency demand compete for the same rooms.** Van Riet &
+  Demeulemeester (2015) document the trade-off directly: capacity reserved for
+  emergencies is capacity not available for the waiting list, and how a hospital splits
+  that capacity is itself a planning decision, not just an emergent property of "leave
+  some slack." This project's model doesn't size that reserve explicitly (see §2,
+  point 7), but it's the reason an emergent-add-on priority tier exists in the model at
+  all.
 
-**Left out, deliberately:**
-- *Stochastic durations.* Every case gets one estimated duration. Real durations are
-  uncertain and tend to run long, and that's a real planning risk — but it roughly
-  doubles the model's complexity (two-stage stochastic programming, or a robust
-  reformulation), and is the natural next step rather than something to bolt on here.
-- *Same-day disruption.* This produces an offline weekly plan. Reacting to an emergency
-  that walks in mid-week is a different problem — reactive rescheduling around an
-  existing plan, not advance scheduling.
-- *Nurses and anaesthetists as separate resources.* They're assumed to come with the
-  room they're rostered to that day. In many hospitals the surgeon's calendar, not the
-  support staff's, is the actual bottleneck; if that's not true at a given hospital,
-  this assumption is the first thing to revisit.
-- *Sequence-dependent room cleaning.* Turnover time depends on how long the case ran
-  (bucketed below), but not on which two specific cases are adjacent in the room. A
-  full equipment changeover between two different specialties' cases is more realistic
-  still — section 8 sketches how that would work and why it's not the primary model.
-- *Multi-week planning.* One week at a time; carrying an unscheduled case into next
-  week's instance is a thin wrapper around this model, not a different one.
+The case brief names several concrete sources of difficulty that show up in real OR
+scheduling — limited room-hours, surgeon availability, shared equipment, turnover
+between cases, downstream bed pressure — and explicitly invites simplification rather
+than a full hospital simulation. Section 2 below states exactly what this model keeps,
+what it leaves out, and why each of those calls was made.
 
-## 2. Where the priority/penalty mechanism comes from
+## 2. Assumptions and simplifications
+
+These are deliberate scoping decisions made up front, each with a reason and a note on
+what relaxing it would actually require — not omissions discovered after the fact.
+
+1. **Deterministic durations.** Every case carries one estimated operative duration
+   (in practice, a historical median for that procedure type) rather than a probability
+   distribution. Real surgical durations are genuinely uncertain, and the bias runs in a
+   predictable direction — schedules built on optimistic point estimates tend to run
+   long, not short, which is exactly the failure mode that produces overtime and
+   downstream cancellations. The deterministic case is the standard tractable starting
+   point in this literature (Denton, Miller, Balasubramanian & Huschka (2010) use it and
+   discuss the stochastic extension directly), and it keeps the model's structure
+   legible enough to verify by hand on a 20-case demo. Treating durations as
+   distributions instead turns this into a two-stage stochastic program — first-stage
+   case placement, second-stage absorption of the realized duration via overtime cost
+   or a bumped case — which is real additional machinery, not a parameter tweak; it's
+   the first item in §12's extension table for that reason, not something quietly
+   folded into this version.
+
+2. **Room turnover depends on the case's own duration, not on which two cases are
+   adjacent.** A longer procedure plausibly needs a longer reset — more instruments to
+   account for, more drapes, often a bigger room turnover — so turnover time is bucketed
+   by the case's own operative duration (§5 has the exact buckets and where they come
+   from) rather than fixed at one flat number for every case. What this still leaves out
+   is the *sequence*-dependent piece: a genuine deep clean after a contaminated case, or
+   a full equipment changeover between two different specialties' cases back to back,
+   costs more than the bucket alone captures, and that cost depends on which two cases
+   end up adjacent in the room, not on either case in isolation. Modeling that properly
+   needs a different primitive — a sequence variable with a transition-cost matrix
+   between case types — which is exactly what the optional CP Optimizer backend in
+   Appendix B demonstrates. It isn't the primary model because the gain doesn't show up
+   structurally in the cases that matter most here (rooms in this project's demo data
+   are rostered to one service per day, so a same-room service *switch* never actually
+   occurs — see Appendix B.1's honest note on that).
+
+3. **Surgeons are the binding staffing resource; nurses and anaesthetists aren't
+   modeled separately.** Support staff are assumed to come bundled with whichever room
+   is rostered and staffed that day. This is a real, common simplification exactly when
+   it's true that the surgeon's own calendar — not the support team's — is what actually
+   constrains the schedule, which tends to hold for hospitals where nursing rosters are
+   built around the room/block schedule rather than the other way around. Where it
+   isn't true (a hospital genuinely short on scrub nurses or anaesthetists, independent
+   of which surgeon is operating), this is the first assumption to drop, and the
+   mechanism for dropping it is already in the model: extend $H$ to cover support
+   staff and reuse the same NoOverlap/sum pattern already built for surgeons (§12).
+
+4. **At most one occurrence per patient per week.** A patient with several queued
+   procedures gets at most one of them scheduled in a given week's instance. This is the
+   conservative default, not a clinical rule — some services legitimately combine
+   same-day multi-procedure cases (shared anaesthesia, one recovery period), and that's
+   a real efficiency a hospital might want to capture. It's deliberately not assumed
+   here because it's service-specific (what counts as safely combinable is a clinical
+   judgment, not a scheduling one), and a wrong default in that direction is harder to
+   catch than a merely conservative one.
+
+5. **Bed/ICU capacity is constant across the week, with an explicit overflow charge
+   rather than a silent approximation.** Recovery and ICU beds are modeled as a shared,
+   capacity-limited resource (§9, constraint C11), but that capacity doesn't vary by day
+   — a hospital with a real weekend staffing cut, where fewer beds are actually
+   available, would need a per-day-segmented version instead. Rather than ignore that
+   gap or simply forbid any stay from crossing into it, a stay that runs past the
+   modeled week is charged an explicit, configurable overflow penalty (§5,
+   `weekend_bed_overflow_penalty`) instead of being silently approximated either as free
+   or as impossible.
+
+6. **One ad hoc institutional rule is included as a worked example, not a special case
+   bolted onto the math.** A configurable "pediatric block" carve-out — a given
+   service's rooms, on a given day, restricted to patients under some age — is in the
+   model specifically to demonstrate that real hospitals' accumulated local rules don't
+   require new variable families. It's one more eligibility predicate evaluated before
+   a candidate slot is even created (§8), the same mechanism as the room-service roster.
+   The age threshold itself (8 years, in the demo data) is illustrative, not clinical
+   guidance.
+
+7. **Single week, single hospital, no same-day disruption, no explicit emergency
+   reserve.** The model produces an offline plan for one week at one site and does not
+   re-optimize when an emergency case arrives mid-week, nor does it carve out a separate
+   capacity reserve for emergencies the way Van Riet & Demeulemeester (2015) describe
+   real hospitals doing (§1). Reacting to a disruption against an existing plan is a
+   genuinely different problem from building the plan in the first place — it's the
+   second item in §12's extension table, not something this version pretends to handle
+   by being silent about it.
+
+## 3. Where the priority/penalty mechanism comes from
 
 Cases are ranked into four clinical priority tiers, each with a maximum acceptable wait,
 and the objective penalizes a case the longer it sits past that deadline. This isn't
@@ -46,24 +142,25 @@ invented for this exercise — it's how several public health systems actually m
 elective waiting lists:
 
 - Portugal's SIGIC system (Portaria n.º 45/2008) sets four priority tiers with maximum
-  waits of 270/60/15/3 days. An audit of one hospital's 2016 waiting list found 16% of
-  roughly 7,400 patients had already breached their tier's deadline, by an average of
-  147 days (Marques & Captivo, 2015) — breach rates are tracked because they're the
-  thing the planner actually gets judged on, not a side metric.
+  waits of 270/60/15/3 days. The 2016 audit cited in §1 — 16% of roughly 7,400 patients
+  already past their tier's deadline, by 147 days on average (Marques & Captivo, 2015)
+  — is exactly why breach penalties in this model aren't cosmetic: it's the number a
+  planner using this kind of system is actually graded on.
 - The UK NHS's Referral-to-Treatment targets and several Canadian provincial wait-time
   benchmarks use the same shape: tiered maximum waits, tracked breach rates. A single
   FIFO queue doesn't reflect clinical risk, and "shortest job first" doesn't either.
 - Cardoen, Demeulemeester & Beliën's (2010) literature review treats case-to-day
   assignment under a priority/deadline structure as a distinct, well-studied
   sub-problem ("advance scheduling") — the scope this model targets, extended with
-  exact intra-day timing (§3).
+  exact intra-day timing (§4).
 
 Every number attached to this mechanism — maximum wait per tier, the priority
 multipliers, the penalty curve — is a field on `PlanningInstance`
 (`src/model/types.py`), not a constant buried in solver code. A hospital adopting this
-plugs in its own policy without touching the model.
+plugs in its own policy without touching the model; §5 below explains exactly how those
+defaults were chosen and what a real deployment should replace.
 
-## 3. Why constraint programming, not a bigger MILP
+## 4. Why constraint programming, not a bigger MILP
 
 This is the central modeling decision in the project, so it's worth arguing rather than
 asserting.
@@ -116,7 +213,7 @@ objective, same priority/eligibility constraints, but room and equipment capacit
 expressed as linear sums instead of exact non-overlap. RESULTS.md reports the
 head-to-head run; the result is what the argument predicts.
 
-## 4. Sets and parameters
+## 5. Sets and parameters
 
 | Symbol | Meaning |
 |---|---|
@@ -130,48 +227,175 @@ head-to-head run; the result is what the argument predicts.
 | Parameter | Meaning |
 |---|---|
 | $t_c^{op}$ | Operative duration of case $c$ (minutes) |
-| $t_c^{clean}$ | Room turnover after case $c$ — set from $t_c^{op}$ (§7), not a flat constant |
+| $t_c^{clean}$ | Room turnover after case $c$ — set from $t_c^{op}$ (§6.1), not a flat constant |
 | $t_c^{tot} = t_c^{op} + t_c^{clean}$ | Total room-occupation time |
 | $k_{dr}$ | Opening minutes of room $r$ on day $d$ |
 | $k_{hd}$ | Surgeon $h$'s daily operative-time limit on day $d$ |
 | $k_h$ | Surgeon $h$'s weekly operative-time limit |
 | $p_c \in \{1,2,3,4\}$ | Clinical priority of $c$ — 4 means "must run today" |
 | $\text{wl}_c$ | Days $c$ has already waited as of the planning date |
-| $\text{wl}^{max}_p$ | Maximum acceptable wait for priority $p$ (default 270 / 60 / 15 / 3 days) |
+| $\text{wl}^{max}_p$ | Maximum acceptable wait for priority $p$ (default 270 / 60 / 15 / 3 days, §6.3) |
 | $dd_c = \text{wl}^{max}_{p_c} - \text{wl}_c$ | Slack to deadline (negative = already overdue) |
-| $\mu_p$ | Priority multiplier (default 1 / 4.5 / 18 / 90, priority-1-equivalent) |
-| $w_c$ | Non-scheduling penalty for $c$ (§6) |
-| $\alpha > 1$ | Urgency multiplier applied to overdue cases (default 2.0) |
+| $\mu_p$ | Priority multiplier (default 1 / 4.5 / 18 / 90, §6.3) |
+| $w_c$ | Non-scheduling penalty for $c$ (§7) |
+| $\alpha > 1$ | Urgency multiplier applied to overdue cases (default 2.0, §6.4) |
 | $u_{ce} \in \{0,1\}$ | 1 if case $c$ needs equipment $e$ |
-| $\kappa_{ed}$ | Capacity of equipment $e$ on day $d$ |
+| $\kappa_{ed}$ | Capacity of equipment $e$ on day $d$ (§6.5) |
 | $\rho(c)$ | Recovery/bed pool case $c$ needs ("none" if not applicable) |
 | $\text{los}_c$ | Length of stay in that pool, in days |
-| $\beta_\rho$ | Bed count for pool $\rho$ (constant across the week — §7) |
-| $\pi^{ovf}$ | Per-day penalty for a bed stay crossing the horizon boundary |
+| $\beta_\rho$ | Bed count for pool $\rho$ (constant across the week — §2, point 5) |
+| $\pi^{ovf}$ | Per-day penalty for a bed stay crossing the horizon boundary (§6.5) |
 
 A room is also tied to one service per day (its roster), may be ambulatory-only, and may
 fall under an optional pediatric-block rule restricting it to patients under some age on
 a given day. These are eligibility predicates, not extra variables — see §8.
 
-## 5. Decision variables
+## 6. How the parameters were calibrated
 
-For every $(c, d, r)$ that survives eligibility filtering (right service, right scope,
-not blocked by the pediatric rule, surgeon available that day):
+Every default below lives on `PlanningInstance` (`src/model/types.py`,
+`src/data/instances.py`), not hardcoded in solver logic, specifically so a hospital can
+override its own policy without touching the model. This section is the honest
+breakdown of where each default actually comes from — literature, a derivable rule, a
+deliberate choice to make the demo data exercise a constraint, or a placeholder a real
+deployment must replace — because those four categories call for very different levels
+of trust.
 
-$$\text{pr}_{cdr} \in \{0,1\} \qquad \text{start}_{cdr} \in [0, k_{dr}]$$
+### 6.1 Room turnover (15 / 25 / 40 minutes, by duration)
 
-a presence flag and a start time, plus an unscheduled flag for every case that isn't
-priority-4:
+Real OR turnover is reported anywhere from about 15 to 60 minutes depending on
+procedure complexity and infection-control needs — a single flat number for every case
+understates that spread in one direction (overcharging quick cases) without correcting
+it in the other (undercharging long ones). The three buckets used here —
+$t_c^{clean} = 15$ for $t_c^{op}\le60$, $25$ for $60<t_c^{op}\le150$, $40$ for
+$t_c^{op}>150$ — are a deliberately simple proxy for that spread: short cases need less
+to reset (fewer instruments, less drape area), long cases plausibly need more. This is
+a heuristic, not a measured rule — it captures the part of real turnover variation that
+correlates with how long the case itself ran, but not the part that depends on *which
+two cases* are adjacent (point 2 in §2; Appendix B has the more expressive alternative).
+A real deployment should replace these three numbers with a hospital's own measured
+turnover times, bucketed however its data actually clusters.
 
-$$u_c \in \{0,1\}, \qquad \sum_{d,r} \text{pr}_{cdr} + u_c = 1$$
+### 6.2 Room hours and surgeon time budgets
 
-CP-SAT additionally turns each candidate slot into two interval variables of different
-sizes — one sized $t_c^{tot}$ for room occupancy, one sized $t_c^{op}$ for the surgeon's
-own time — because a room needs to stay blocked through cleaning while the surgeon is
-free as soon as the operation ends. FORMULATION_CP.md §3 has the exact CP-SAT objects;
-this section states the model independently of how any one solver represents it.
+Room opening minutes ($k_{dr}$) in the demo data range from 360 to 660 minutes/day (6
+to 11 hours) across the three services, chosen to give the instance a mix of tight and
+generous rooms rather than one uniform block — this is an instance-design choice to
+exercise both a binding and a non-binding room-capacity constraint in the same demo, not
+a number taken from any one hospital's actual published hours.
 
-## 6. Objective
+Surgeon limits are more structurally grounded: 240 minutes/day in the demo data is one
+standard half-day theatre session, a common scheduling unit in the block-scheduling
+literature (Cardoen et al., 2010); 960 minutes/week (four such sessions) reflects a
+typical surgical job plan where a consultant's week splits across theatre time, clinics,
+ward rounds, and on-call duties, rather than being theatre time five days straight. The
+`medium_instance()` generator uses 300/1300 instead — a "larger hospital group, higher
+throughput" framing for that specific synthetic instance, an explicit modeling choice
+for testing at scale, not a second citation. Either way, this is the first number a real
+deployment should swap for the receiving hospital's actual published session length and
+job-plan structure.
+
+### 6.3 Maximum waits and priority multipliers
+
+The maximum-wait defaults (270 / 60 / 15 / 3 days) are taken directly from Portugal's
+SIGIC policy (§3) — they're used as a credible, evidence-based starting point precisely
+because they're a real system's actual policy, not because this model targets the
+Portuguese system specifically. A hospital with its own published wait-time targets
+should use those instead; the field exists on `PlanningInstance` for exactly that
+substitution.
+
+The priority multipliers $\mu_p$ (1 / 4.5 / 18 / 90) aren't a separately invented set of
+numbers — they're built directly from the same maximum-wait figures, as the ratio of
+priority-1's allowance to each tier's own:
+
+$$\mu_p = \frac{\text{wl}^{max}_1}{\text{wl}^{max}_p} \qquad\Rightarrow\qquad
+\mu_2=\tfrac{270}{60}=4.5,\quad \mu_3=\tfrac{270}{15}=18,\quad \mu_4=\tfrac{270}{3}=90$$
+
+The reasoning behind that specific rule: a tier that's only allowed a twelfth of
+priority-1's wait before breaching (priority-3's 15 days vs. priority-1's 270) is, by
+the policy's own design, treated as roughly twelve times more wait-sensitive — so
+weighting a day of breach at that tier twelve times as heavily as a day of breach at
+priority-1 is consistent with the same policy that set the wait targets in the first
+place, rather than a second, independent judgment call. That's a real starting point,
+but it is still ultimately a modeling choice, not an empirical fact — see §6.6 for how a
+hospital would actually calibrate it for its own risk tolerance, and the equity caveat
+that comes with doing that calibration uniformly across tiers.
+
+### 6.4 The urgency multiplier $\alpha$ and the displacement margin
+
+$\alpha=2.0$ scales the day coefficient for already-overdue cases in the objective's
+Term 2, so the model prefers to front-load an overdue case earlier in the week once it's
+decided to schedule it at all. $\alpha$ appears nowhere else in the model — not in Term
+3 (the non-scheduling penalty), not in any constraint — so it can provably only change
+*which day* an overdue case lands on, never *how many* cases get scheduled or *which*
+ones; that's governed by capacity and by Term 3's relative size, and neither involves
+$\alpha$. A hospital tuning this value is deciding how hard to front-load already-late
+cases, not how many late cases get served.
+
+The non-scheduling penalty $w_c$ (§7) needs to dominate every Term-1/2 coefficient a
+scheduled case could accrue, or the model could prefer dropping a schedulable case
+purely to dodge a tardiness charge. The largest such coefficient is bounded by
+$\max_c dd_c + \alpha\cdot n_{days}$ (a maximally-slack case, evaluated on the last day,
+in the overdue branch), so the minimum safe displacement margin is
+
+$$\text{margin}_{\min} = 1 + \frac{\alpha \cdot n_{days}}{\max_c dd_c}$$
+
+With this project's defaults ($\alpha=2$, $n_{days}=5$, $\max_c dd_c\approx270$ for a
+priority-1 case at its policy's maximum wait), $\text{margin}_{\min}\approx1.037$ — so
+the 1.2 used in $w_c$'s formula (§7) clears it with real margin to spare, which matters
+because $\max_c dd_c$ shrinks on an instance with only short-horizon, high-priority
+cases, and a fixed margin has to stay safe across that range, not just on this one
+instance.
+
+### 6.5 Equipment and bed capacity
+
+The demo instance gives the shared C-arm a capacity of exactly 1, deliberately tight
+enough to force real contention among the four cases that need it — the point of this
+parameter in the demo data is to make the CP-vs-MILP gap in §4 actually visible, not to
+model one specific hospital's actual imaging-unit inventory. `medium_instance()` scales
+this to 2, loosely tracking the larger case volume rather than any particular
+inventory count.
+
+ICU bed capacity (2/day in the demo instance, 6/day in the medium instance) follows the
+same logic: tight enough that a couple of long-stay cases create real pressure on the
+pool, without making the instance infeasible outright. The overflow penalty
+$\pi^{ovf}=50$ per day (§2, point 5) is sized to sit between the two things it has to
+balance: large enough relative to a typical Term-1/2 day-coefficient swing that the
+model actually avoids pushing a stay past the horizon when there's a same-quality
+alternative, but small enough relative to $w_c$ (which runs from the hundreds into the
+low thousands once the priority multiplier and displacement are applied) that the model
+never prefers leaving a case off the schedule entirely just to avoid one overflow day.
+None of these three numbers — C-arm capacity, bed capacity, overflow penalty — are
+measured from a real hospital; they're sized to make the demo instance exercise the
+constraint they attach to, and should be replaced with a hospital's actual equipment
+inventory and bed census before this touches a real planning cycle.
+
+The 12% ICU-admission probability used inside `medium_instance()`'s random case
+generator is a notch further removed even than that: it only controls how the synthetic
+test data is generated and is never seen by the optimizer as a parameter at all. It
+should be replaced with real admission-rate data for the relevant procedures, not tuned
+as if it were a policy knob.
+
+### 6.6 Calibrating $\mu_p$ for a real hospital, and an equity caveat worth flagging early
+
+§6.3's $\mu_p=\text{wl}^{max}_1/\text{wl}^{max}_p$ rule is a defensible starting point,
+not a substitute for an actual policy conversation, because the multiplier ultimately
+encodes a hospital's own risk tolerance for breaching each tier — and that's a clinical
+and institutional judgment, not something a formula can derive on its own. In practice,
+calibrating it means structured elicitation with service chiefs, anchored on concrete
+trade-offs ("a priority-2 patient 30 days over target versus a priority-1 patient 200
+days over theirs — which is worse, by roughly what factor?") rather than asking for
+multiplier values directly, since clinicians reason fluently in scenarios and rarely in
+objective-function coefficients.
+
+One thing worth flagging *before* that conversation, not after: because $\mu_p$ is keyed
+to priority *tier*, not to overdue severity directly, raising it uniformly protects
+high-tier cases generally, not specifically the most-overdue ones. If one specialty's
+case mix happens to skew toward lower tiers and longer overdue stretches at the same
+time, a uniform increase in $\mu_p$ does nothing for it. The right fix for that, if it
+shows up in practice, is a per-service tracked target or a fairness constraint layered
+on top (§12), not a bigger global multiplier.
+
+## 7. Objective
 
 $$
 \min \quad
@@ -192,19 +416,37 @@ $$w_c = \mu_{p_c}\cdot\text{PenaltyCurve}(dd_c) + 1.2\cdot\max_{c'\in C} dd_{c'}
 
 `PenaltyCurve` (`src/model/penalty.py`) is flat while a case still has slack, then
 escalates sharply once it crosses its deadline and keeps climbing the longer it stays
-overdue — the shape several of the systems cited in §2 use to make breaches expensive
+overdue — the shape several of the systems cited in §3 use to make breaches expensive
 rather than just "less preferred." $\mu_{p_c}$ scales that curve's output once, by
-priority tier. The $1.2 \times \max dd_{c'}$ term is a displacement large enough that
-$w_c$ always exceeds any Term-1/2 coefficient a scheduled case could accrue (§9 derives
-the exact margin needed and shows 1.2 clears it) — so the model only ever drops a case
-when there genuinely isn't room for it, never as a cheap way to dodge a tardiness charge.
+priority tier, per §6.3. The $1.2\times\max dd_{c'}$ term is the displacement derived in
+§6.4, sized so $w_c$ always exceeds any Term-1/2 coefficient a scheduled case could
+accrue — the model only ever drops a case when there genuinely isn't room for it, never
+as a cheap way to dodge a tardiness charge.
 
 The fourth term only applies to cases needing a recovery/ICU bed and is explained
-alongside the constraint it pairs with, C11, in FORMULATION_CP.md §5.
+alongside the constraint it pairs with, C11, in FORMULATION_CP.md §4.
 
-## 7. Constraints, summarized
+## 8. Decision variables
 
-Full math for each is in FORMULATION_CP.md §5, with the same numbering used in the
+For every $(c, d, r)$ that survives eligibility filtering (right service, right scope,
+not blocked by the pediatric rule, surgeon available that day):
+
+$$\text{pr}_{cdr} \in \{0,1\} \qquad \text{start}_{cdr} \in [0, k_{dr}]$$
+
+a presence flag and a start time, plus an unscheduled flag for every case that isn't
+priority-4:
+
+$$u_c \in \{0,1\}, \qquad \sum_{d,r} \text{pr}_{cdr} + u_c = 1$$
+
+CP-SAT additionally turns each candidate slot into two interval variables of different
+sizes — one sized $t_c^{tot}$ for room occupancy, one sized $t_c^{op}$ for the surgeon's
+own time — because a room needs to stay blocked through cleaning while the surgeon is
+free as soon as the operation ends. FORMULATION_CP.md §2 has the exact CP-SAT objects;
+this section states the model independently of how any one solver represents it.
+
+## 9. Constraints, summarized
+
+Full math for each is in FORMULATION_CP.md §4, with the same numbering used in the
 solver's code comments.
 
 - **C1.** At most one scheduled occurrence per patient this week.
@@ -220,18 +462,12 @@ solver's code comments.
   concurrency, not total hours.
 - **C9.** Surgeon weekly time limit.
 - **C10.** Shared equipment capacity, checked against actual time overlap rather than a
-  daily headcount — the constraint family §3's argument is built on.
+  daily headcount — the constraint family §4's argument is built on.
 - **C11.** Recovery/ICU bed capacity. A bed stay starts on the day of surgery and runs
   for `los_c` days; this needs a real notion of "day of surgery" to even state, which is
   the concrete reason this model is interval-based at all rather than a day-bucket sum.
 
-Room turnover after each case is set from the case's own duration (§4.2), and the
-default surgeon limits (240 min/day, 960 min/week in the demo instance) correspond to a
-standard half-day theatre block, with the weekly figure leaving most of a fifth day for
-clinics, ward rounds, and on-call duties — a real structural pattern in how surgical job
-plans are usually built, not a single cited number.
-
-## 8. Two carve-outs worth calling out
+## 10. Two carve-outs worth calling out
 
 **Room-service roster (C4).** In practice an OR is set up and staffed for one specialty
 at a time, not shared minute-by-minute across services — this is captured as a
@@ -243,43 +479,7 @@ point of including one is that it costs nothing structurally — it's one more e
 predicate evaluated during candidate generation, not a new variable family or a special
 case in the objective.
 
-## 9. Why the displacement margin is 1.2, not something smaller
-
-Term 3 needs to dominate Terms 1–2 for every case, or the model could prefer dropping a
-schedulable case just to avoid a tardiness charge. The largest Term-1/2 coefficient any
-case can reach is bounded by $\max_c dd_c + \alpha \cdot n_{days}$ (a maximally-slack
-case, evaluated on the last day, in the overdue branch), so the minimum safe margin is
-
-$$\text{margin}_{\min} = 1 + \frac{\alpha \cdot n_{days}}{\max_c dd_c}$$
-
-With this project's defaults ($\alpha=2$, $n_{days}=5$, $\max_c dd_c \approx 270$ for a
-priority-1 case at its policy's maximum wait), $\text{margin}_{\min} \approx 1.037$ — so
-1.2 already clears it with room to spare, which matters because $\max_c dd_c$ shrinks on
-an instance with only short-horizon, high-priority cases, and a fixed margin needs to
-stay safe across that range, not just on this one instance.
-
-$\alpha$ itself appears nowhere except inside Term 2's day coefficient, so it can only
-change *which day within the week* an already-scheduled overdue case lands on — it has
-no path to changing *how many* cases get scheduled or *which* ones, since that's governed
-by capacity and by Term 3's relative size, neither of which involves $\alpha$. A hospital
-tuning $\alpha$ is deciding how hard to front-load overdue cases earlier in the week, not
-how many overdue cases get served — that second question is what $\mu_p$ controls.
-
-On calibrating $\mu_p$ in practice: there's no published "correct" multiplier vector,
-because it encodes a hospital's own risk tolerance for breaching each tier, not an
-empirical fact. The practical approach is structured elicitation with service chiefs,
-anchored on concrete trade-offs ("a priority-2 patient 30 days over target versus a
-priority-1 patient 200 days over theirs — which is worse, by roughly what factor?")
-rather than asking for multiplier values directly, since clinicians reason fluently in
-scenarios and rarely in objective-function coefficients. One thing worth flagging before
-that conversation: because $\mu_p$ is keyed to priority *tier*, not to overdue severity
-directly, raising it uniformly protects high-tier cases generally, not specifically the
-most-overdue ones — if one specialty's case mix happens to skew toward lower tiers and
-longer overdue stretches at the same time, a uniform increase in $\mu_p$ does nothing for
-it. The right fix for that, if it shows up in practice, is a per-service tracked target or
-a fairness constraint layered on top, not a bigger global multiplier.
-
-## 10. Testing instances
+## 11. Testing instances
 
 Two instances ship in `src/data/instances.py`:
 
@@ -289,10 +489,10 @@ Two instances ship in `src/data/instances.py`:
 - `medium_instance()` — ~200 cases, 12 rooms, 17 surgeons, modeled loosely on the
   multi-service benchmark structure in Cardoen, Demeulemeester & Beliën (2010). Used to
   check the model still solves in reasonable time once it's too big to eyeball, and
-  where the CP-vs-MILP gap from §3 actually shows up at scale (RESULTS.md).
+  where the CP-vs-MILP gap from §4 actually shows up at scale (RESULTS.md).
 
 For testing against real hospital logs rather than synthetic data, two CC BY-4.0
-datasets are a direct structural fit (same horizon, same master-roster shape as §8):
+datasets are a direct structural fit (same horizon, same master-roster shape as §10):
 
 - Akbarzadeh & Maenhout (2023), *Real life data for operating room scheduling problem*
   (Ghent University Hospital, May 2017). Mendeley Data.
@@ -302,18 +502,20 @@ datasets are a direct structural fit (same horizon, same master-roster shape as 
 Their schema maps onto `PlanningInstance` without any formulation change — what's
 missing is a loader, intentionally not built here given the brief's "small demo" scope.
 
-## 11. Extensions
+## 12. Extensions
 
 | Extension | Approach |
 |---|---|
 | Stochastic durations | Two-stage stochastic program: first stage places cases, second stage absorbs duration draws via overtime cost or a bumped case |
 | Same-day rescheduling | Large-neighbourhood search seeded from the current plan, re-optimizing only around the disruption |
+| Explicit emergency reserve | Carve out a per-day capacity block (room-minutes or a dedicated room) the elective model can't touch, sized from observed emergency demand |
 | Nurse/anaesthetist rostering | Extend $H$ to cover support staff with the same NoOverlap/sum pattern used for surgeons |
 | Multi-week rolling horizon | Solve weekly, carry forward unscheduled cases at a bumped priority |
 | Day-varying bed capacity | Replace the constant $\beta_\rho$ with a per-day-segmented cumulative resource |
-| Per-specialty fairness | A secondary objective or constraint bounding each service's overdue share (§9) |
+| Per-specialty fairness | A secondary objective or constraint bounding each service's overdue share (§6.6) |
+| Sequence-dependent turnover everywhere | Generalize Appendix B's transition-matrix approach beyond the single-service-per-room-per-day roster assumption (§2, point 2) |
 
-## 12. Passing this off to a developer
+## 13. Passing this off to a developer
 
 The four things I'd hand over: this file plus FORMULATION_CP.md, since together they're
 the math and there's nothing to negotiate about variable meaning that isn't already
@@ -329,7 +531,7 @@ projects like this turns out to be vocabulary (what's a "room roster," what does
 math itself, so a short glossary of those terms is worth more than it sounds like it
 should.
 
-## 13. A reusable library of models
+## 14. A reusable library of models
 
 Four layers, solver-agnostic except the bottom one. Core data types first — plain
 dataclasses like `PlanningInstance`, no solver imports — since every model in the
@@ -346,7 +548,7 @@ project runs end to end is itself the template for that last layer: argue the ba
 choice from the problem's structure, then check it empirically on a small instance,
 rather than defaulting to whichever backend the team happens to know best.
 
-## 14. References
+## 15. References
 
 1. Cardoen, B., Demeulemeester, E., & Beliën, J. (2010). Operating room planning and
    scheduling: A literature review. *European Journal of Operational Research*, 201(3),
@@ -360,31 +562,33 @@ rather than defaulting to whichever backend the team happens to know best.
    Diário da República, Portugal.
 5. Van Riet, C., & Demeulemeester, E. (2015). Trade-offs in operating room planning for
    electives and emergencies. *OR Spectrum*, 37(1), 59–87.
-6. Akbarzadeh, B., & Maenhout, B. (2023). Real life data for operating room scheduling
+6. Macario, A. (2010). What does one minute of operating room time cost? *Journal of
+   Clinical Anesthesia*, 22(4), 233–236.
+7. Akbarzadeh, B., & Maenhout, B. (2023). Real life data for operating room scheduling
    problem [Data set]. Mendeley Data, V2. https://doi.org/10.17632/n2v49z2vnp.2
-7. Akbarzadeh, B., & Maenhout, B. (2023). RealLife operating room scheduling dataset,
+8. Akbarzadeh, B., & Maenhout, B. (2023). RealLife operating room scheduling dataset,
    2021-Jan-May [Data set]. Mendeley Data, V1. https://doi.org/10.17632/c8d342266x.1
-8. Perron, L., & Furnon, V. *CP-SAT: a Constraint Programming Solver* (Google OR-Tools
+9. Perron, L., & Furnon, V. *CP-SAT: a Constraint Programming Solver* (Google OR-Tools
    documentation). https://developers.google.com/optimization/cp
-9. Baptiste, P., Le Pape, C., & Nuijten, W. (2001). *Constraint-Based Scheduling:
-   Applying Constraint Programming to Scheduling Problems*. Kluwer Academic Publishers.
-10. Vilím, P. (2004). O(n log n) filtering algorithms for unary resource constraints.
+10. Baptiste, P., Le Pape, C., & Nuijten, W. (2001). *Constraint-Based Scheduling:
+    Applying Constraint Programming to Scheduling Problems*. Kluwer Academic Publishers.
+11. Vilím, P. (2004). O(n log n) filtering algorithms for unary resource constraints.
     *CPAIOR 2004*.
-11. Schutt, A., Feydy, T., Stuckey, P.J., & Wallace, M.G. (2009). Why cumulative
+12. Schutt, A., Feydy, T., Stuckey, P.J., & Wallace, M.G. (2009). Why cumulative
     decomposition is not as bad as it sounds. *CP 2009*.
-12. Laborie, P. (2009). IBM ILOG CP Optimizer for detailed scheduling illustrated on
+13. Laborie, P. (2009). IBM ILOG CP Optimizer for detailed scheduling illustrated on
     three problems. *CPAIOR 2009*.
 
 ---
 
 ## Appendix A — the comparison MILP, in detail
 
-§3 introduces this as the empirical check on the CP-over-MILP argument, not a second
+§4 introduces this as the empirical check on the CP-over-MILP argument, not a second
 deliverable. Implemented in `src/solvers/milp_baseline_solver.py`; runnable via
 `--solver milp-cbc` (bundled, no install needed), `--solver milp-gurobi`, or
 `--solver milp-cplex` (both need a license OR-Tools/gurobipy can see).
 
-Same sets and parameters as §4, minus the CP-only ones ($\pi^{ovf}$, $\rho(c)$,
+Same sets and parameters as §5, minus the CP-only ones ($\pi^{ovf}$, $\rho(c)$,
 $\text{los}_c$, $\beta_\rho$ — beds aren't expressible in this formulation at all, see
 A.4).
 
@@ -405,12 +609,12 @@ $$
 + \sum_{c:p_c\ne4} w_c\,z_c
 $$
 
-Identical in shape to §6's Terms 1–3, over $x_{cdr}/z_c$ instead of
+Identical in shape to §7's Terms 1–3, over $x_{cdr}/z_c$ instead of
 $\text{pr}_{cdr}/u_c$, evaluated by the same `penalty.py` function every backend shares.
 
 ### A.3 Constraints
 
-C1–C6 and C9 are unchanged from §7. C7 and C10 are where this formulation diverges from
+C1–C6 and C9 are unchanged from §9. C7 and C10 are where this formulation diverges from
 the primary model:
 
 **C7 — room capacity as a sum:**
@@ -421,7 +625,7 @@ durations can always be packed sequentially — which is why C7 alone doesn't co
 formulation anything by itself.
 
 **C8 — surgeon, daily minutes only (no non-overlap variable exists in a MILP without a
-big-M reformulation, §3):**
+big-M reformulation, §4):**
 $$\sum_{c:\,\text{surgeon}(c)=h}\sum_r t_c^{op}\,x_{cdr} \le k_{hd} \qquad \forall h,d$$
 
 **C10 — shared equipment, a day-level headcount:**
@@ -450,15 +654,15 @@ project — see B.4 for the honest comparison.
 
 ### B.1 What's different
 
-CP-SAT bakes cleaning into the room interval's own length: every candidate's interval is
-sized $t_c^{tot} = t_c^{op}+t_c^{clean}$, so turnover is charged the same way regardless
-of what case comes next. CP Optimizer instead sizes the interval at $t_c^{op}$ alone and
-charges turnover as a transition cost between whichever two cases end up adjacent in a
-room's chosen sequence, via a `sequence_var` plus a transition matrix on `no_overlap`:
+CP-SAT buckets cleaning time by the case's own duration (§6.1): every candidate's room
+interval is sized $t_c^{tot} = t_c^{op}+t_c^{clean}$, so turnover is a property of one
+case alone. CP Optimizer instead sizes the interval at $t_c^{op}$ alone and charges
+turnover as a transition cost between whichever two cases end up adjacent in a room's
+chosen sequence, via a `sequence_var` plus a transition matrix on `no_overlap`:
 
 | | Same service, back to back | Different service, back to back |
 |---|---|---|
-| CP-SAT (duration-bucketed, §4.2) | charged on the case alone, not the pair | same |
+| CP-SAT (duration-bucketed, §6.1) | charged on the case alone, not the pair | same |
 | CP Optimizer (transition matrix) | 15 min — same equipment setup | 35 min — full changeover |
 
 Neither number is "more correct" in the abstract — both are instance-configurable
@@ -491,6 +695,13 @@ The turnover gaps in its returned schedule were checked directly: every same-ser
 gap between adjacent cases equals exactly 15 minutes, confirming the transition matrix
 is actually binding rather than a no-op.
 
+An honest limit of this demonstration: every room in `demo_instance()`/
+`medium_instance()` is rostered to exactly one service per day (§10), so within any
+room-day every candidate case is automatically the same service — the matrix's
+cross-service branch (35 min) is correctly implemented but never actually exercised on
+either shipped instance. It would engage the moment a room is rostered to more than one
+service in a day.
+
 ### B.4 The honest comparison
 
 | Solver | Status | Objective | Gap | Scheduled | Time |
@@ -506,26 +717,3 @@ this appendix supports is narrower than "CP Optimizer is better": it demonstrate
 a real answer to a real gap in the primary model's turnover assumption), while CP-SAT
 remains the better-tuned, better-performing engine for this project at every scale
 actually tested. That's why it's an appendix, not the model.
-
----
-
-## Appendix C — calibration notes
-
-A few of the constants above are worth flagging honestly rather than presenting as
-settled:
-
-- **Room turnover buckets** (15/25/40 min by duration, §4.2): real OR turnover is
-  reported in the 15–60 minute range depending on procedure complexity and
-  infection-control needs. Bucketing by duration captures part of that spread; a
-  sequence-dependent model (Appendix B) captures another part. Neither is a substitute
-  for a hospital's own measured turnover data.
-- **Surgeon daily/weekly limits** (240/960 min in the demo instance): 240 minutes is one
-  standard half-day theatre session, a common unit in block-scheduling literature
-  (Cardoen et al., 2010). The weekly figure assumes roughly four of five weekdays are
-  theatre days, leaving the rest for clinics and ward rounds — a structural pattern, not
-  a single cited number, and the first thing to replace with a receiving hospital's
-  actual job-plan structure.
-- **ICU admission probability** in `medium_instance()` (12% for vascular/neuro cases):
-  this only controls how the synthetic test data is generated — it isn't a parameter
-  the optimizer ever sees, and it should be replaced with real admission data before any
-  of this touches a real planning cycle.

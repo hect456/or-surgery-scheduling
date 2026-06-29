@@ -1,7 +1,7 @@
 # Results
 
 What the demo actually produces, and why it backs up the CP-over-MILP argument in
-FORMULATION.md §3. Reproducible with `python main.py --instance {demo,medium}
+FORMULATION.md §4. Reproducible with `python main.py --instance {demo,medium}
 --benchmark`.
 
 Environment: Windows, Python 3.12, `ortools` 9.x (CBC bundled, CP-SAT), `gurobipy`
