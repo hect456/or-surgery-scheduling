@@ -40,17 +40,96 @@ worth getting right rather than improvising room-by-room:
   Demeulemeester (2015) document the trade-off directly: capacity reserved for
   emergencies is capacity not available for the waiting list, and how a hospital splits
   that capacity is itself a planning decision, not just an emergent property of "leave
-  some slack." This project's model doesn't size that reserve explicitly (see §2,
+  some slack." This project's model doesn't size that reserve explicitly (see §4,
   point 7), but it's the reason an emergent-add-on priority tier exists in the model at
   all.
 
 The case brief names several concrete sources of difficulty that show up in real OR
 scheduling — limited room-hours, surgeon availability, shared equipment, turnover
 between cases, downstream bed pressure — and explicitly invites simplification rather
-than a full hospital simulation. Section 2 below states exactly what this model keeps,
+than a full hospital simulation. Section 4 below states exactly what this model keeps,
 what it leaves out, and why each of those calls was made.
 
-## 2. Assumptions and simplifications
+## 2. Where the priority/penalty mechanism comes from
+
+Cases are ranked into four clinical priority tiers, each with a maximum acceptable wait,
+and the objective penalizes a case the longer it sits past that deadline. This isn't
+invented for this exercise — it's how several public health systems actually manage
+elective waiting lists:
+
+- Portugal's SIGIC system (Portaria n.º 45/2008) sets four priority tiers with maximum
+  waits of 270/60/15/3 days. The 2016 audit cited in §1 — 16% of roughly 7,400 patients
+  already past their tier's deadline, by 147 days on average (Marques & Captivo, 2015)
+  — is exactly why breach penalties in this model aren't cosmetic: it's the number a
+  planner using this kind of system is actually graded on.
+- The UK NHS's Referral-to-Treatment targets and several Canadian provincial wait-time
+  benchmarks use the same shape: tiered maximum waits, tracked breach rates. A single
+  FIFO queue doesn't reflect clinical risk, and "shortest job first" doesn't either.
+- Cardoen, Demeulemeester & Beliën's (2010) literature review treats case-to-day
+  assignment under a priority/deadline structure as a distinct, well-studied
+  sub-problem ("advance scheduling") — the scope this model targets, extended with
+  exact intra-day timing (§3).
+
+Every number attached to this mechanism — maximum wait per tier, the priority
+multipliers, the penalty curve — is a field on `PlanningInstance`
+(`src/model/types.py`), not a constant buried in solver code. A hospital adopting this
+plugs in its own policy without touching the model; §6 below explains exactly how those
+defaults were chosen and what a real deployment should replace.
+
+## 3. Why constraint programming, not a bigger MILP
+
+This is the central modeling decision in the project, so it's worth arguing rather than
+asserting.
+
+The problem is disjunctive resource-constrained scheduling: cases competing for rooms,
+surgeons, and a shared piece of equipment, each of which can hold exactly one thing at a
+time (or, for the equipment, a small fixed number of things). That's precisely the
+structure CP's global constraints — `NoOverlap`, `Cumulative` — exist for, and it's
+exactly the structure a linear capacity-sum constraint gets wrong in one specific way:
+
+A constraint like "total minutes of equipment use today ≤ capacity" certifies that a set
+of cases' durations *fit* inside the day. It does not certify they can be placed
+*without colliding*. For a single, non-shared room those two statements happen to
+coincide — any set of durations that fits a day can always be laid out sequentially. They
+stop coinciding the moment a resource is shared across more than one room, which is
+exactly the shape of this project's C-arm: a sum can forbid two genuinely
+non-overlapping uses just because they land on the same day, while in other configurations
+it can be too permissive in the other direction. This isn't a theoretical nuance —
+RESULTS.md shows the demo instance's day-bucket equipment cap forbidding a schedule
+that's perfectly legal once you check actual clock times.
+
+The textbook MILP alternative — a continuous-time disjunctive formulation with one
+binary "A-before-B" variable per potentially-conflicting pair of cases, tied together
+with big-M constraints — works, but has two costs that are well documented (Baptiste, Le
+Pape & Nuijten, *Constraint-Based Scheduling*, 2001): the variable count grows
+quadratically in the number of conflicting pairs, and the big-M constants weaken the LP
+relaxation as that count grows, so branch-and-bound spends real time re-discovering
+structure a propagation-based method gets for free. It also can't express a resource
+with capacity greater than one (a 2-bed pool, say) without yet more pairwise variables.
+
+`NoOverlap` and `Cumulative` are global constraints with their own specialized,
+polynomial-time propagation — `NoOverlap` via an O(n log n) sweep (Vilím, 2004),
+`Cumulative` via timetabling/edge-finding (Schutt, Feydy, Stuckey & Wallace, 2009). They
+prune the search directly from the problem's time/resource structure instead of making
+the solver rediscover it pair by pair through branching. That's the actual mechanism
+behind "CP scales better here" — not a vague claim that one solver is smarter than
+another.
+
+**Why CP-SAT specifically.** It runs a parallel portfolio of search strategies — several
+complete-search workers plus large-neighborhood-search workers improving an incumbent,
+sharing learned information through a common core (Perron & Furnon, Google OR-Tools
+documentation). The implementation doesn't hand-roll a branching strategy on top of
+this; OR-Tools' own guidance is that the default portfolio beats a hand-tuned single
+strategy unless you have structural insight the model isn't already exposing through
+its `NoOverlap`/`Cumulative` calls, and this project doesn't.
+
+A day-bucket MILP was also built (`src/solvers/milp_baseline_solver.py`) — not as a
+second deliverable, but as the empirical check on the argument above: same sets, same
+objective, same priority/eligibility constraints, but room and equipment capacity
+expressed as linear sums instead of exact non-overlap. RESULTS.md reports the
+head-to-head run; the result is what the argument predicts.
+
+## 4. Assumptions and simplifications
 
 These are deliberate scoping decisions made up front, each with a reason and a note on
 what relaxing it would actually require — not omissions discovered after the fact.
@@ -73,7 +152,7 @@ what relaxing it would actually require — not omissions discovered after the f
 2. **Room turnover depends on the case's own duration, not on which two cases are
    adjacent.** A longer procedure plausibly needs a longer reset — more instruments to
    account for, more drapes, often a bigger room turnover — so turnover time is bucketed
-   by the case's own operative duration (§5 has the exact buckets and where they come
+   by the case's own operative duration (§6 has the exact buckets and where they come
    from) rather than fixed at one flat number for every case. What this still leaves out
    is the *sequence*-dependent piece: a genuine deep clean after a contaminated case, or
    a full equipment changeover between two different specialties' cases back to back,
@@ -134,85 +213,6 @@ what relaxing it would actually require — not omissions discovered after the f
    second item in §12's extension table, not something this version pretends to handle
    by being silent about it.
 
-## 3. Where the priority/penalty mechanism comes from
-
-Cases are ranked into four clinical priority tiers, each with a maximum acceptable wait,
-and the objective penalizes a case the longer it sits past that deadline. This isn't
-invented for this exercise — it's how several public health systems actually manage
-elective waiting lists:
-
-- Portugal's SIGIC system (Portaria n.º 45/2008) sets four priority tiers with maximum
-  waits of 270/60/15/3 days. The 2016 audit cited in §1 — 16% of roughly 7,400 patients
-  already past their tier's deadline, by 147 days on average (Marques & Captivo, 2015)
-  — is exactly why breach penalties in this model aren't cosmetic: it's the number a
-  planner using this kind of system is actually graded on.
-- The UK NHS's Referral-to-Treatment targets and several Canadian provincial wait-time
-  benchmarks use the same shape: tiered maximum waits, tracked breach rates. A single
-  FIFO queue doesn't reflect clinical risk, and "shortest job first" doesn't either.
-- Cardoen, Demeulemeester & Beliën's (2010) literature review treats case-to-day
-  assignment under a priority/deadline structure as a distinct, well-studied
-  sub-problem ("advance scheduling") — the scope this model targets, extended with
-  exact intra-day timing (§4).
-
-Every number attached to this mechanism — maximum wait per tier, the priority
-multipliers, the penalty curve — is a field on `PlanningInstance`
-(`src/model/types.py`), not a constant buried in solver code. A hospital adopting this
-plugs in its own policy without touching the model; §6 below explains exactly how those
-defaults were chosen and what a real deployment should replace.
-
-## 4. Why constraint programming, not a bigger MILP
-
-This is the central modeling decision in the project, so it's worth arguing rather than
-asserting.
-
-The problem is disjunctive resource-constrained scheduling: cases competing for rooms,
-surgeons, and a shared piece of equipment, each of which can hold exactly one thing at a
-time (or, for the equipment, a small fixed number of things). That's precisely the
-structure CP's global constraints — `NoOverlap`, `Cumulative` — exist for, and it's
-exactly the structure a linear capacity-sum constraint gets wrong in one specific way:
-
-A constraint like "total minutes of equipment use today ≤ capacity" certifies that a set
-of cases' durations *fit* inside the day. It does not certify they can be placed
-*without colliding*. For a single, non-shared room those two statements happen to
-coincide — any set of durations that fits a day can always be laid out sequentially. They
-stop coinciding the moment a resource is shared across more than one room, which is
-exactly the shape of this project's C-arm: a sum can forbid two genuinely
-non-overlapping uses just because they land on the same day, while in other configurations
-it can be too permissive in the other direction. This isn't a theoretical nuance —
-RESULTS.md shows the demo instance's day-bucket equipment cap forbidding a schedule
-that's perfectly legal once you check actual clock times.
-
-The textbook MILP alternative — a continuous-time disjunctive formulation with one
-binary "A-before-B" variable per potentially-conflicting pair of cases, tied together
-with big-M constraints — works, but has two costs that are well documented (Baptiste, Le
-Pape & Nuijten, *Constraint-Based Scheduling*, 2001): the variable count grows
-quadratically in the number of conflicting pairs, and the big-M constants weaken the LP
-relaxation as that count grows, so branch-and-bound spends real time re-discovering
-structure a propagation-based method gets for free. It also can't express a resource
-with capacity greater than one (a 2-bed pool, say) without yet more pairwise variables.
-
-`NoOverlap` and `Cumulative` are global constraints with their own specialized,
-polynomial-time propagation — `NoOverlap` via an O(n log n) sweep (Vilím, 2004),
-`Cumulative` via timetabling/edge-finding (Schutt, Feydy, Stuckey & Wallace, 2009). They
-prune the search directly from the problem's time/resource structure instead of making
-the solver rediscover it pair by pair through branching. That's the actual mechanism
-behind "CP scales better here" — not a vague claim that one solver is smarter than
-another.
-
-**Why CP-SAT specifically.** It runs a parallel portfolio of search strategies — several
-complete-search workers plus large-neighborhood-search workers improving an incumbent,
-sharing learned information through a common core (Perron & Furnon, Google OR-Tools
-documentation). The implementation doesn't hand-roll a branching strategy on top of
-this; OR-Tools' own guidance is that the default portfolio beats a hand-tuned single
-strategy unless you have structural insight the model isn't already exposing through
-its `NoOverlap`/`Cumulative` calls, and this project doesn't.
-
-A day-bucket MILP was also built (`src/solvers/milp_baseline_solver.py`) — not as a
-second deliverable, but as the empirical check on the argument above: same sets, same
-objective, same priority/eligibility constraints, but room and equipment capacity
-expressed as linear sums instead of exact non-overlap. RESULTS.md reports the
-head-to-head run; the result is what the argument predicts.
-
 ## 5. Sets and parameters
 
 | Symbol | Meaning |
@@ -243,7 +243,7 @@ head-to-head run; the result is what the argument predicts.
 | $\kappa_{ed}$ | Capacity of equipment $e$ on day $d$ (§6.5) |
 | $\rho(c)$ | Recovery/bed pool case $c$ needs ("none" if not applicable) |
 | $\text{los}_c$ | Length of stay in that pool, in days |
-| $\beta_\rho$ | Bed count for pool $\rho$ (constant across the week — §2, point 5) |
+| $\beta_\rho$ | Bed count for pool $\rho$ (constant across the week — §4, point 5) |
 | $\pi^{ovf}$ | Per-day penalty for a bed stay crossing the horizon boundary (§6.5) |
 
 A room is also tied to one service per day (its roster), may be ambulatory-only, and may
@@ -271,7 +271,7 @@ $t_c^{op}>150$ — are a deliberately simple proxy for that spread: short cases 
 to reset (fewer instruments, less drape area), long cases plausibly need more. This is
 a heuristic, not a measured rule — it captures the part of real turnover variation that
 correlates with how long the case itself ran, but not the part that depends on *which
-two cases* are adjacent (point 2 in §2; Appendix B has the more expressive alternative).
+two cases* are adjacent (point 2 in §4; Appendix B has the more expressive alternative).
 A real deployment should replace these three numbers with a hospital's own measured
 turnover times, bucketed however its data actually clusters.
 
@@ -297,7 +297,7 @@ job-plan structure.
 ### 6.3 Maximum waits and priority multipliers
 
 The maximum-wait defaults (270 / 60 / 15 / 3 days) are taken directly from Portugal's
-SIGIC policy (§3) — they're used as a credible, evidence-based starting point precisely
+SIGIC policy (§2) — they're used as a credible, evidence-based starting point precisely
 because they're a real system's actual policy, not because this model targets the
 Portuguese system specifically. A hospital with its own published wait-time targets
 should use those instead; the field exists on `PlanningInstance` for exactly that
@@ -350,7 +350,7 @@ instance.
 
 The demo instance gives the shared C-arm a capacity of exactly 1, deliberately tight
 enough to force real contention among the four cases that need it — the point of this
-parameter in the demo data is to make the CP-vs-MILP gap in §4 actually visible, not to
+parameter in the demo data is to make the CP-vs-MILP gap in §3 actually visible, not to
 model one specific hospital's actual imaging-unit inventory. `medium_instance()` scales
 this to 2, loosely tracking the larger case volume rather than any particular
 inventory count.
@@ -358,7 +358,7 @@ inventory count.
 ICU bed capacity (2/day in the demo instance, 6/day in the medium instance) follows the
 same logic: tight enough that a couple of long-stay cases create real pressure on the
 pool, without making the instance infeasible outright. The overflow penalty
-$\pi^{ovf}=50$ per day (§2, point 5) is sized to sit between the two things it has to
+$\pi^{ovf}=50$ per day (§4, point 5) is sized to sit between the two things it has to
 balance: large enough relative to a typical Term-1/2 day-coefficient swing that the
 model actually avoids pushing a stay past the horizon when there's a same-quality
 alternative, but small enough relative to $w_c$ (which runs from the hundreds into the
@@ -416,7 +416,7 @@ $$w_c = \mu_{p_c}\cdot\text{PenaltyCurve}(dd_c) + 1.2\cdot\max_{c'\in C} dd_{c'}
 
 `PenaltyCurve` (`src/model/penalty.py`) is flat while a case still has slack, then
 escalates sharply once it crosses its deadline and keeps climbing the longer it stays
-overdue — the shape several of the systems cited in §3 use to make breaches expensive
+overdue — the shape several of the systems cited in §2 use to make breaches expensive
 rather than just "less preferred." $\mu_{p_c}$ scales that curve's output once, by
 priority tier, per §6.3. The $1.2\times\max dd_{c'}$ term is the displacement derived in
 §6.4, sized so $w_c$ always exceeds any Term-1/2 coefficient a scheduled case could
@@ -462,7 +462,7 @@ solver's code comments.
   concurrency, not total hours.
 - **C9.** Surgeon weekly time limit.
 - **C10.** Shared equipment capacity, checked against actual time overlap rather than a
-  daily headcount — the constraint family §4's argument is built on.
+  daily headcount — the constraint family §3's argument is built on.
 - **C11.** Recovery/ICU bed capacity. A bed stay starts on the day of surgery and runs
   for `los_c` days; this needs a real notion of "day of surgery" to even state, which is
   the concrete reason this model is interval-based at all rather than a day-bucket sum.
@@ -489,7 +489,7 @@ Two instances ship in `src/data/instances.py`:
 - `medium_instance()` — ~200 cases, 12 rooms, 17 surgeons, modeled loosely on the
   multi-service benchmark structure in Cardoen, Demeulemeester & Beliën (2010). Used to
   check the model still solves in reasonable time once it's too big to eyeball, and
-  where the CP-vs-MILP gap from §4 actually shows up at scale (RESULTS.md).
+  where the CP-vs-MILP gap from §3 actually shows up at scale (RESULTS.md).
 
 For testing against real hospital logs rather than synthetic data, two CC BY-4.0
 datasets are a direct structural fit (same horizon, same master-roster shape as §10):
@@ -513,7 +513,7 @@ missing is a loader, intentionally not built here given the brief's "small demo"
 | Multi-week rolling horizon | Solve weekly, carry forward unscheduled cases at a bumped priority |
 | Day-varying bed capacity | Replace the constant $\beta_\rho$ with a per-day-segmented cumulative resource |
 | Per-specialty fairness | A secondary objective or constraint bounding each service's overdue share (§6.6) |
-| Sequence-dependent turnover everywhere | Generalize Appendix B's transition-matrix approach beyond the single-service-per-room-per-day roster assumption (§2, point 2) |
+| Sequence-dependent turnover everywhere | Generalize Appendix B's transition-matrix approach beyond the single-service-per-room-per-day roster assumption (§4, point 2) |
 
 ## 13. Passing this off to a developer
 
@@ -583,7 +583,7 @@ rather than defaulting to whichever backend the team happens to know best.
 
 ## Appendix A — the comparison MILP, in detail
 
-§4 introduces this as the empirical check on the CP-over-MILP argument, not a second
+§3 introduces this as the empirical check on the CP-over-MILP argument, not a second
 deliverable. Implemented in `src/solvers/milp_baseline_solver.py`; runnable via
 `--solver milp-cbc` (bundled, no install needed), `--solver milp-gurobi`, or
 `--solver milp-cplex` (both need a license OR-Tools/gurobipy can see).
@@ -625,7 +625,7 @@ durations can always be packed sequentially — which is why C7 alone doesn't co
 formulation anything by itself.
 
 **C8 — surgeon, daily minutes only (no non-overlap variable exists in a MILP without a
-big-M reformulation, §4):**
+big-M reformulation, §3):**
 $$\sum_{c:\,\text{surgeon}(c)=h}\sum_r t_c^{op}\,x_{cdr} \le k_{hd} \qquad \forall h,d$$
 
 **C10 — shared equipment, a day-level headcount:**

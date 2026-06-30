@@ -96,6 +96,32 @@
   Canadian provincial wait-time benchmarks.
 \end{frame}
 
+\begin{frame}{Case study: how SIGIC enforces its own deadlines}
+  SIGIC is not just a published target -- it is run by \textbf{ACSS}
+  (\emph{Administra\c{c}\~ao Central do Sistema de Sa\'ude}), the central
+  authority that all NHS-affiliated hospitals report into through a shared
+  national registry, so every patient's wait clock is tracked centrally,
+  not hospital-by-hospital.
+
+  \vspace{0.4em}
+  \textbf{The mechanism that gives the deadline teeth: the surgical
+  voucher (\emph{Cheque Cirúrgico}).} When a hospital cannot operate
+  within a case's tier deadline, the patient gains the right to be
+  referred to an \emph{alternative} provider -- public, private, or
+  social-sector -- inside the SIGIC network, paid for by the NHS rather
+  than the originating hospital.
+
+  \pause
+  \begin{block}{Why this is the right real-world analog for $w_c$}
+    A breach under SIGIC is not just a worse statistic -- it becomes a
+    \emph{real, billable cost} to the institution that missed the
+    deadline. That is exactly the role the non-scheduling penalty $w_c$
+    plays in this model's objective (Term 3): it is sized to be large
+    enough that the optimiser treats a breach as something to actively
+    avoid, not a number to merely report after the fact.
+  \end{block}
+\end{frame}
+
 \begin{frame}{Case study: the 2016 CHLN audit}
   Marques \& Captivo (2015) audited the \textbf{Centro Hospitalar Lisboa
   Norte (CHLN)} waiting list against SIGIC targets:

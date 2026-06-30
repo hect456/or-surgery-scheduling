@@ -129,7 +129,7 @@ shared-equipment concurrency, and a downstream recovery/ICU-bed constraint.
 
 **Why CP-SAT, not a bigger MILP:** the problem is disjunctive resource-constrained
 scheduling — exactly the structure `NoOverlap`/`Cumulative` exist for, with
-polynomial-time propagation instead of a big-M disjunctive encoding. FORMULATION.md §4
+polynomial-time propagation instead of a big-M disjunctive encoding. FORMULATION.md §3
 makes the full argument; RESULTS.md checks it empirically.
 
 ---
