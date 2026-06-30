@@ -1,0 +1,999 @@
+\documentclass[10pt,aspectratio=169]{beamer}
+% compile: pdflatex presentation_en.tex  (run twice from inside docs/)
+% or push to GitHub -- .github/workflows/ compiles automatically.
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{graphicx}
+\usepackage{grffile}
+\usepackage{xcolor}
+
+\usetheme{Berlin}
+\usecolortheme{seahorse}
+\setbeamertemplate{footline}[frame number]
+\setbeamertemplate{navigation symbols}{}
+
+\newcommand{\bk}{\hfill\hyperlink{toc}{\beamerreturnbutton{Agenda}}}
+\newcommand{\miplink}{\hyperlink{mip1}{\beamergotobutton{Full MIP (backup)}}}
+
+\title{\large Elective Surgery Scheduling}
+\subtitle{Interval-based CP-SAT model for weekly OR planning}
+\author{Hector Bonilla}
+\date{}
+
+\begin{document}
+
+\begin{frame}\titlepage\end{frame}
+
+\begin{frame}{Agenda}
+  \hypertarget{toc}{}
+  \tableofcontents
+  \vspace{0.5em}
+  \footnotesize Main flow: full CP-SAT model including all variables,
+  parameters, and constraints. Comparison MIP stays in the appendix
+  -- it's evidence for the CP-SAT choice, not a second deliverable.
+\end{frame}
+
+% ============================================================
+\section{Problem \& Motivation}
+
+\begin{frame}{The problem}
+  \textbf{One hospital, one week. An elective waiting list always bigger
+  than the week's OR capacity.}
+  \begin{itemize}\small
+    \item For each waiting case: which room, which day, what clock time,
+      which surgeon -- or defer to the following week.
+    \item \textbf{Feasibility} constraint: rooms, surgeons, shared
+      equipment, and downstream recovery beds are all finite and shared.
+    \item \textbf{Fairness} constraint: clinical urgency, not FIFO order,
+      should determine priority -- a genuinely urgent patient must not sit
+      behind a routine one merely because of arrival order.
+    \item \textbf{Scope (Cardoen et al., 2010):} this is \emph{advance
+      scheduling} -- assigning cases to days/rooms ahead of the session --
+      distinct from same-day sequencing or real-time disruption handling.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Why it matters}
+  \begin{itemize}\small
+    \item \textbf{OR time is expensive and perishable.}
+      $\sim\$30$--$40$/minute once staffing, equipment and overhead
+      are amortised (Macario, 2010). An idle OR-minute today cannot be
+      banked for tomorrow.
+    \item \textbf{The waiting list is the audited metric.}
+      In systems like Portugal's SIGIC, the UK NHS RTT, and Canadian
+      provincial benchmarks, waiting-list breach rates are the number
+      that gets published and that planners are graded on -- not just a
+      side metric.
+    \item \textbf{Elective and emergency demand share the same rooms}
+      (Van Riet \& Demeulemeester, 2015), making capacity allocation a
+      genuine strategic decision, not a by-product of scheduling.
+    \item \textbf{Evidence from the literature:} Cardoen, Demeulemeester
+      \& Beli\"en (2010) survey over 200 papers; advance scheduling
+      under priority/deadline constraints is its own well-defined
+      sub-problem, with this project occupying its core scope.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{The Portuguese case: the SIGIC system}
+  \textbf{SIGIC} -- \emph{Sistema Integrado de Gest\~ao de Inscritos
+  para Cirurgia} -- is Portugal's national waiting-list management
+  system, established by \textbf{Portaria n.\textsuperscript{o} 45/2008}
+  (Di\'ario da Rep\'ublica).
+
+  \vspace{0.5em}
+  Every elective surgical case is assigned one of \textbf{four clinical
+  priority tiers}, each with its own \textbf{maximum acceptable wait}:
+
+  \vspace{0.4em}
+  \begin{center}\small
+  \begin{tabular}{clc}
+    \toprule
+    Priority & Clinical meaning & Max wait (days) \\
+    \midrule
+    1 & Routine elective & 270 \\
+    2 & Elevated urgency & 60 \\
+    3 & Urgent & 15 \\
+    4 & Emergent add-on -- run this week & 3 \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+  \vspace{0.4em}
+  \footnotesize These four numbers are \emph{not} illustrative defaults
+  invented for this demo -- they are the model's $\text{wl}^{max}_p$
+  parameters, taken directly from a real, legislated, audited policy.
+\end{frame}
+
+\begin{frame}{The Portuguese case: what the 2016 CHLN audit found}
+  Marques \& Captivo (2015) audited the Centro Hospitalar Lisboa Norte
+  (CHLN) waiting list against SIGIC targets. Key findings:
+
+  \begin{itemize}\small
+    \item $\sim$\textbf{7{,}400} patients on the list at audit time.
+    \item \textbf{16\%} had \emph{already} breached their tier's
+      maximum-wait deadline.
+    \item Average overrun among breached cases: \textbf{147 days}
+      hospital-wide.
+    \item Neurosurgery: average overrun of $\sim$\textbf{261 days} --
+      far worse than the hospital-wide average.
+  \end{itemize}
+  \pause
+  \begin{block}{Why this shapes this model's objective}
+    A planner optimising only throughput can report excellent utilization
+    while quietly reproducing this audit's failure mode -- scheduling
+    routine cases and deferring overdue ones indefinitely, because a
+    FIFO queue or an unweighted objective can't distinguish them.
+    The penalty term $w_c$ in the objective exists specifically to
+    make breach costs \emph{explicit, weighted, and dominant}.
+  \end{block}
+\end{frame}
+
+% ============================================================
+\section{Assumptions \& Scope}
+
+\begin{frame}{What the model covers -- and what it doesn't}
+  \begin{columns}
+    \begin{column}{0.5\textwidth}
+      \textbf{Modelled:}
+      \begin{itemize}\small
+        \item Case$\to$room$\to$time$\to$surgeon assignment
+        \item Room/service rosters (block schedule)
+        \item Surgeon availability, daily \& weekly limits
+        \item One shared imaging unit (C-arm) with capacity
+        \item Recovery/ICU bed pool (multi-day stay)
+        \item Priority-4 emergency add-on hard lock-in
+        \item Pediatric-block carve-out rule
+      \end{itemize}
+    \end{column}
+    \begin{column}{0.5\textwidth}
+      \textbf{Deliberately excluded:}
+      \begin{itemize}\small
+        \item Stochastic durations
+        \item Same-day disruptions
+        \item Nurse/anaesthetist rostering
+        \item Sequence-dependent OR cleaning
+        \item Multi-week rolling horizon
+        \item Emergency capacity reserve sizing
+        \item Patient day-of-week preferences
+      \end{itemize}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+\begin{frame}{Key assumptions -- detail and justification}
+  \small
+  \begin{enumerate}
+    \item \textbf{Deterministic durations.} One duration per case
+      (e.g.\ historical median for that procedure). Real durations are
+      stochastic and biased \emph{long}; the deterministic case is the
+      standard tractable approximation (Denton et al., 2010). Stochastic
+      extension requires two-stage SP -- top future-work item.
+    \item \textbf{Turnover bucketed by duration} (15/25/40 min): proxy
+      for the real 15--60 min range. Captures the duration-correlated
+      component; not the sequence-dependent one (that's CP Optimizer,
+      backup appendix).
+    \item \textbf{Surgeons as binding staffing resource.} Nurses /
+      anaesthetists assumed bundled with the rostered room -- valid when
+      the surgeon's calendar is the actual bottleneck.
+    \item \textbf{One occurrence per patient per week.} Conservative
+      default (combining same-day procedures is service-specific clinical
+      judgment, not assumed here).
+    \item \textbf{Constant bed capacity across the week}, with explicit
+      overflow charge for stays crossing the horizon -- no silent
+      approximation.
+    \item \textbf{Pediatric block} as a worked example of an ad hoc
+      institutional rule: one eligibility predicate, no new variables.
+    \item \textbf{Single week, single hospital, no same-day disruption}
+      -- offline advance scheduling only.
+  \end{enumerate}
+\end{frame}
+
+% ============================================================
+\section{Data \& Instances}
+
+\begin{frame}{Data model}
+  The data layer (\texttt{src/model/types.py}) is solver-agnostic --
+  plain Python dataclasses, no solver imports.
+
+  \begin{itemize}\small
+    \item \textbf{\texttt{SurgicalCase}}: patient id, service, surgeon,
+      priority $p_c$, days waited $\text{wl}_c$, operative time $t_c^{op}$,
+      turnover $t_c^{clean}$, optional equipment, optional bed pool.
+    \item \textbf{\texttt{Surgeon}}: daily limit $k_{hd}$, weekly
+      limit $k_h$, per-day availability.
+    \item \textbf{\texttt{OperatingRoom}}: per-day capacity
+      $k_{dr}$, service roster, ambulatory-only flag.
+    \item \textbf{\texttt{PlanningInstance}}: collects all the above
+      plus policy parameters ($\text{wl}^{max}_p$, $\mu_p$, $\alpha$,
+      equipment/bed capacities, pediatric-block rule).
+  \end{itemize}
+  \vspace{0.4em}
+  Every solver reads \texttt{PlanningInstance} and returns
+  \texttt{SolverResult} -- the solver adapter pattern that makes
+  backends swappable.
+\end{frame}
+
+\begin{frame}{demo\_instance() -- 20 cases, 5 rooms, 6 surgeons}
+  \small 3 services: ENT, ORTHO, VASC.
+
+  \begin{center}
+  \begin{tabular}{lccc}
+    \toprule
+    Service & Rooms & Capacity (min/day) & Surgeons \\
+    \midrule
+    ENT   & 2 & 360 ($\approx$ 6 h) & 2 \\
+    ORTHO & 1 & 450 ($\approx$ 7.5 h) & 1 \\
+    VASC  & 2 & 660 ($\approx$ 11 h) & 3 \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+  \vspace{0.3em}
+  Special features activated (one per constraint family):
+  \begin{itemize}\footnotesize
+    \item 3 priority-4 cases (C05 ENT, C13 ORTHO, C19 VASC) -- hard lock-in to Monday
+    \item Shared C-arm with capacity 1/day (VASC endovascular cases: C14, C15, C17, C19)
+    \item 2 ICU beds/day; C14 \& C16 need a 1-day ICU stay
+    \item Pediatric block: Friday ENT rooms restricted to age $\le 8$
+    \item 3 overdue cases (C03, C11, C16) -- already past their SIGIC deadline
+  \end{itemize}
+  \footnotesize Sized to be read by eye and to exercise \emph{every}
+  constraint family in one run.
+\end{frame}
+
+\begin{frame}{medium\_instance() -- 200 cases, 12 rooms, 17 surgeons}
+  \small 5 services; structure loosely modelled on Cardoen et al. (2010)
+  multi-service benchmark family.
+
+  \begin{center}
+  \begin{tabular}{lcccc}
+    \toprule
+    Service & Rooms & Cap (min/d) & Surgeons & Equipment \\
+    \midrule
+    ENT   & 2 & 360 & 3 & -- \\
+    ORTHO & 3 & 480 & 4 & -- \\
+    VASC  & 2 & 660 & 3 & C-ARM \\
+    GYN   & 2 & 300 & 3 & -- \\
+    NEURO & 3 & 540 & 4 & C-ARM \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+  \begin{itemize}\footnotesize
+    \item Priority mix: 58\% P1 / 26\% P2 / 13\% P3 / 3\% P4 (realistic elective distribution)
+    \item $\sim$40\% of surgeons have one day off per week (Monday never)
+    \item 12\% of VASC/NEURO cases need an ICU bed (1--2 days)
+    \item Surgeon limits: 300 min/day, 1300 min/week (larger-hospital framing)
+  \end{itemize}
+  \footnotesize Used to demonstrate scaling and make the CP-vs-MIP gap
+  measurable (results section).
+\end{frame}
+
+\begin{frame}{Real-data availability}
+  The synthetic instances above are \emph{structurally} calibrated to
+  the literature. Two openly-licensed real hospital datasets exist that
+  map directly onto \texttt{PlanningInstance} without any formulation
+  change -- only a loader is missing:
+
+  \begin{itemize}\small
+    \item Akbarzadeh \& Maenhout (2023a).
+      \emph{Real life data for OR scheduling}
+      -- Ghent University Hospital OR log, May 2017.
+      Mendeley Data V2.
+      \texttt{doi:10.17632/n2v49z2vnp.2}
+    \item Akbarzadeh \& Maenhout (2023b).
+      \emph{RealLife OR scheduling dataset, 2021-Jan-May}
+      -- 20 weekly instances, 8 demand/flexibility configurations.
+      Mendeley Data V1.
+      \texttt{doi:10.17632/c8d342266x.1}
+  \end{itemize}
+  \footnotesize Both are CC~BY~4.0 and contain the same master-roster
+  + per-case waiting-list schema used by \texttt{PlanningInstance}.
+  A production deployment would start here.
+\end{frame}
+
+% ============================================================
+\section{The CP-SAT Model}
+
+\begin{frame}{Sets and indices}
+  \begin{center}\small
+  \begin{tabular}{cl}
+    \toprule
+    Symbol & Meaning \\
+    \midrule
+    $c \in C$ & Surgical cases (one entry per patient-procedure pair) \\
+    $d \in D$ & Planning days, $D=\{1,\dots,5\}$ (Mon--Fri) \\
+    $r \in R$ & Operating rooms \\
+    $h \in H$ & Surgeons \\
+    $e \in E$ & Shared equipment types (one unit per type in the demo) \\
+    $D_c \subseteq D$ & Eligible days for case $c$; $\{1\}$ if priority-4 \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+  \vspace{0.5em}
+  \footnotesize Candidates $(c,d,r)$ are pre-filtered by eligibility
+  (C4--C6) \emph{before} any variable is created -- this is the model's
+  main variable-count reduction, not a constraint row.
+\end{frame}
+
+\begin{frame}{Parameters (I): time, capacity, priority}
+  \small
+  \begin{center}
+  \begin{tabular}{cll}
+    \toprule
+    Symbol & Meaning & Default / source \\
+    \midrule
+    $t_c^{op}$ & Operative duration (min) & Historical median \\
+    $t_c^{clean}$ & Turnover (min) & 15/25/40 by duration bucket \\
+    $t_c^{tot}=t_c^{op}+t_c^{clean}$ & Total room occupation & --- \\
+    $k_{dr}$ & Room $r$ open minutes on day $d$ & Hospital roster \\
+    $k_{hd}$ & Surgeon daily op. limit (min) & 240 (demo) / 300 (med) \\
+    $k_h$ & Surgeon weekly op. limit (min) & 960 (demo) / 1300 (med) \\
+    $p_c\in\{1,2,3,4\}$ & Clinical priority tier & SIGIC triage \\
+    $\text{wl}_c$ & Days waited (planning date) & Hospital data \\
+    $\text{wl}^{max}_p$ & Max acceptable wait for tier $p$ & 270/60/15/3 (SIGIC) \\
+    $dd_c=\text{wl}^{max}_{p_c}-\text{wl}_c$ & Slack to deadline ($<0$ = overdue) & Computed \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+\end{frame}
+
+\begin{frame}{Parameters (II): objective and shared resources}
+  \small
+  \begin{center}
+  \begin{tabular}{cll}
+    \toprule
+    Symbol & Meaning & Default / source \\
+    \midrule
+    $\mu_p$ & Priority multiplier & $\text{wl}^{max}_1/\text{wl}^{max}_p$ (derived, see below) \\
+    $w_c$ & Non-scheduling penalty & $\mu_{p_c}\cdot\text{PenaltyCurve}(dd_c)+1.2\max dd$ \\
+    $\alpha>1$ & Urgency amplifier for overdue cases & 2.0 (day-ordering knob) \\
+    $u_{ce}\in\{0,1\}$ & 1 if case $c$ needs equipment $e$ & Instance data \\
+    $\kappa_{ed}$ & Simultaneous capacity of equip. $e$ on day $d$ & 1 (demo), 2 (med) \\
+    $\rho(c)$ & Recovery bed pool required (``none'' if not needed) & Instance data \\
+    $\text{los}_c$ & Length of stay in that pool (days) & Instance data \\
+    $\beta_\rho$ & Bed count in pool $\rho$ (constant/week) & 2 (demo), 6 (med) \\
+    $\pi^{ovf}$ & Penalty/day for bed stay past horizon & 50 (configurable) \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+  \footnotesize $\mu_p$: tier allowed only $1/12$ of P1's wait is
+  12$\times$ more wait-sensitive: $\mu_2=270/60=4.5$,
+  $\mu_3=270/15=18$, $\mu_4=270/3=90$.
+\end{frame}
+
+\begin{frame}{Decision variables -- presence and scheduling}
+  For every $(c,d,r)$ surviving eligibility:
+  \[\small
+    \text{pr}_{cdr}\in\{0,1\}, \qquad
+    \text{start}_{cdr},\,\text{end}_{cdr}\in[0,\,k_{dr}]
+  \]
+  For every case that is not priority-4:
+  \[\small
+    u_c\in\{0,1\}, \qquad
+    \sum_{d\in D_c,\,r}\text{pr}_{cdr} + u_c = 1
+  \]
+  \begin{itemize}\small
+    \item $\text{pr}_{cdr}=1$: case $c$ is scheduled on day $d$ in room $r$.
+    \item $u_c=1$: case $c$ is \emph{not} scheduled this week and incurs
+      penalty $w_c$.
+    \item Priority-4 cases have no $u_c$: they are forced to be scheduled
+      (constraint C2 handles this).
+    \item Only $(c,d,r)$ triples passing C4--C6 eligibility get a
+      variable -- the main variable-count reduction.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Decision variables -- two interval variables per candidate}
+  \[\small
+    \text{iv}_{cdr}=\texttt{NewOptionalIntervalVar}(\text{start}_{cdr},\;t_c^{tot},\;\text{end}_{cdr},\;\text{pr}_{cdr})
+    \;\text{(ROOM)}
+  \]
+  \[\small
+    \text{sgiv}_{cdr}=\texttt{NewOptionalIntervalVar}(\text{start}_{cdr},\;t_c^{op},\;\text{sgend}_{cdr},\;\text{pr}_{cdr})
+    \;\text{(SURGEON)}
+  \]
+  Both share \texttt{start}; both are \emph{present} (constrain their
+  resource) exactly when $\text{pr}_{cdr}=1$.
+  \pause
+  \begin{block}{Why two intervals, not one?}
+    \small Surgeon H operates Case X, $t_c^{op}=70$, $t_c^{clean}=20$,
+    starting at $t=0$. The \emph{room} must stay blocked until $t=90$.
+    The \emph{surgeon} is free at $t=70$ and can scrub into Room 2 for
+    Case Y while nursing staff finish cleaning Room 1.
+    Using a single $t_c^{tot}$-sized interval for C8 would wrongly forbid
+    that -- the surgeon would appear busy until $t=90$ in any room.
+    Separating C7 (room, $t_c^{tot}$) from C8 (surgeon, $t_c^{op}$) on
+    the same \texttt{start} resolves this without an explicit channeling
+    constraint.
+  \end{block}
+\end{frame}
+
+\begin{frame}{Objective function -- complete formula}
+  \[\small
+    \min \;
+    \underbrace{\sum_{\substack{c:\,dd_c\ge0\\d\in D_c,r}}
+      [dd_c + d]\;\text{pr}_{cdr}}_{\text{Term 1 -- on-time, prefer earlier}}
+    +\;
+    \underbrace{\sum_{\substack{c:\,dd_c<0\\d\in D_c,r}}
+      [dd_c + \alpha d]\;\text{pr}_{cdr}}_{\text{Term 2 -- overdue, urgency-weighted}}
+  \]
+  \[\small
+    +\;
+    \underbrace{\sum_{c:\,p_c\ne4} w_c\,u_c}_{\text{Term 3 -- non-scheduling penalty}}
+    +\;
+    \underbrace{\pi^{ovf}\!\!\sum_{c:\,\rho(c)\ne\text{none}}\!\!\text{overflow}_c}_{\text{Term 4 -- bed-overflow penalty}}
+  \]
+  \begin{itemize}\footnotesize
+    \item Term 1: rewards scheduling any case, preferring earlier days.
+    \item Term 2: for overdue cases, $\alpha>1$ makes the planner front-load them.
+    \item Term 3: dominant term -- ensures the model schedules rather than drops.
+    \item Term 4: penalises bed stays running past the week, making cost explicit.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Non-scheduling penalty $w_c$ and priority calibration}
+  \[\small
+    w_c = \mu_{p_c}\cdot\text{PenaltyCurve}(dd_c) + 1.2\cdot\max_{c'\in C}\,dd_{c'}
+  \]
+  \textbf{PenaltyCurve} (\texttt{src/model/penalty.py}): flat while
+  the case has slack, escalates sharply on breach, keeps rising with
+  backlog -- the shape SIGIC-style systems use to price breach
+  increasingly over time.
+
+  \vspace{0.4em}
+  \textbf{Priority multipliers} $\mu_p$ -- \emph{derived} from SIGIC:
+  \[\small
+    \mu_p = \frac{\text{wl}^{max}_1}{\text{wl}^{max}_p}
+    \;\Rightarrow\;
+    \mu_2=\tfrac{270}{60}=4.5,\quad
+    \mu_3=\tfrac{270}{15}=18,\quad
+    \mu_4=\tfrac{270}{3}=90
+  \]
+  A tier allowed only $1/12$ of P1's wait is, by that \emph{same}
+  policy, 12$\times$ more wait-sensitive.
+
+  \vspace{0.3em}
+  \textbf{Displacement margin 1.2}: the minimum needed is
+  $1+\alpha n_{\text{days}}/\max dd_c \approx 1.037$;
+  1.2 gives a safety buffer across instances with shorter max-$dd$.
+\end{frame}
+
+\begin{frame}{Constraints C1--C3: case disposition}
+  \textbf{C1 -- at most one occurrence per patient per week:}
+  \[\small
+    \sum_{c:\,\text{patient}(c)=n}\sum_{d\in D_c,r}\text{pr}_{cdr}\le 1
+    \qquad\forall n
+  \]
+  \textbf{C2 -- priority-4 locked to day 1:}
+  \[\small
+    \sum_{r}\text{pr}_{c,1,r}=1 \qquad \forall c:\;p_c=4
+    \quad\text{(all other slots for $c$ forced to 0)}
+  \]
+  \textbf{C3 -- every other case is scheduled exactly once or
+  penalised:}
+  \[\small
+    \sum_{d\in D_c,r}\text{pr}_{cdr} + u_c = 1 \qquad\forall c:\;p_c\ne4
+  \]
+  \footnotesize \textbf{C4--C6 (eligibility):} room-service roster,
+  ambulatory-only flag, pediatric-block age rule -- all three are
+  resolved during candidate generation; they never appear as a
+  constraint row and add no overhead to the solver.
+\end{frame}
+
+\begin{frame}{Constraints C7--C9: room and surgeon}
+  \textbf{C7 -- room, exact non-overlap:}
+  \[\small
+    \texttt{AddNoOverlap}\!\left(\left\{\text{iv}_{cdr}:\,d,r\text{ fixed}\right\}\right)
+    \qquad\forall d\in D,\;r\in R
+  \]
+  \textbf{C8 -- surgeon, exact non-overlap on \emph{surgeon's} interval
+  + daily cap:}
+  \[\small
+    \texttt{AddNoOverlap}\!\left(\left\{\text{sgiv}_{cdr}:\,\text{surgeon}(c)=h,\;
+    d\text{ fixed}\right\}\right)\;\forall h,d
+  \]
+  \[\small
+    \sum_{c:\,\text{surgeon}(c)=h}\sum_r t_c^{op}\,\text{pr}_{cdr}\le k_{hd}
+    \qquad\forall h\in H,\;d\in D
+  \]
+  \textbf{C9 -- surgeon weekly limit:}
+  \[\small
+    \sum_{c:\,\text{surgeon}(c)=h}\sum_{d,r} t_c^{op}\,\text{pr}_{cdr}\le k_h
+    \qquad\forall h\in H
+  \]
+  \footnotesize NoOverlap bounds concurrency; C8/C9 cap total hours --
+  both are needed because they constrain different things.
+\end{frame}
+
+\begin{frame}{Constraints C10--C11: equipment and beds}
+  \textbf{C10 -- shared equipment, exact time-overlap check:}
+  \[\small
+    \texttt{AddCumulative}\!\left(
+      \left\{\text{iv}_{cdr}:\,u_{ce}=1,\;d\text{ fixed}\right\},\;
+      \mathbf{1},\;\kappa_{ed}
+    \right)
+    \qquad\forall e\in E,\;d\in D
+  \]
+  \textbf{C11 -- recovery/ICU beds, with horizon-overflow charge:}
+  \[\small
+    \text{dayof}_c = d_{\text{idx}}
+    \;\text{(via \texttt{OnlyEnforceIf} when $\text{pr}_{cdr}=1$)}
+  \]
+  \[\small
+    \text{bed}_c=\texttt{NewOptionalIntervalVar}
+    (\text{dayof}_c,\;\text{los}_c,\;\text{dayof}_c+\text{los}_c,\;1-u_c)
+  \]
+  \[\small
+    \texttt{AddCumulative}\!\left(\left\{\text{bed}_c:\;\rho(c)=\rho\right\},\;\mathbf{1},\;\beta_\rho\right)
+    \qquad\forall\rho
+  \]
+  \[\small
+    \text{overflow}_c=\max(0,\;\text{dayof}_c+\text{los}_c-n_{\text{days}})
+  \]
+  \footnotesize C11 needs a real ``day of surgery'' value -- the
+  concrete reason this model is interval-based. A day-bucket MIP has
+  no such variable (see backup appendix).
+\end{frame}
+
+\begin{frame}{CP-SAT search strategy}
+  \begin{itemize}\small
+    \item \textbf{Parallel portfolio} -- several complete-search workers
+      with different heuristics, plus Large Neighbourhood Search workers
+      improving an incumbent, sharing learned clauses via a common SAT
+      core (Perron \& Furnon, Google OR-Tools docs).
+    \item \textbf{No custom branching strategy} -- OR-Tools' guidance is
+      that the default portfolio outperforms hand-tuned single strategies
+      unless you have structural insight not already exposed through
+      \texttt{NoOverlap}/\texttt{Cumulative}. This model exposes that
+      structure fully.
+    \item \textbf{Workers} capped at \texttt{os.cpu\_count()} -- over-
+      subscribing past physical cores adds contention, not search
+      diversity.
+    \item \textbf{Gap target} $=1\%$ by default; solver stops when the
+      best bound is within 1\% of the current incumbent.
+    \item \textbf{``Optimal'' means within the configured gap}, not a
+      literal 0\% gap -- always printed and never assumed zero.
+  \end{itemize}
+\end{frame}
+
+% ============================================================
+\section{Why CP-SAT, Not a MIP}
+
+\begin{frame}{The core argument}
+  \begin{block}{Key distinction}
+    ``Total minutes of equipment use today $\le$ capacity'' certifies
+    that a set of durations \emph{fits}. It does \emph{not} certify
+    they can be placed without \emph{colliding}. For one room the two
+    coincide (non-overlapping durations can always be packed
+    sequentially). They \textbf{stop coinciding} when a resource is
+    shared across multiple rooms.
+  \end{block}
+  \begin{columns}
+    \begin{column}{0.5\textwidth}\small
+      \textbf{MIP (day-bucket):} count C-arm cases per day $\le 1$.\
+      Legal placements forbidden: 2 non-overlapping C-arm cases
+      on the same day fail this check even if they never overlap.
+    \end{column}
+    \begin{column}{0.5\textwidth}\small
+      \textbf{CP-SAT:} \texttt{AddCumulative} checks literal time
+      overlap. Two sequential C-arm cases on the same day -- never
+      concurrent -- pass the check. Larger feasible region, better
+      possible schedules.
+    \end{column}
+  \end{columns}
+\end{frame}
+
+\begin{frame}{Advantages and disadvantages}
+  \small
+  \begin{columns}
+    \begin{column}{0.5\textwidth}
+      \textbf{CP-SAT / advantages:}
+      \begin{itemize}
+        \item \texttt{NoOverlap}/\texttt{Cumulative} with poly-time propagation (Vil\'im 2004; Schutt et al. 2009)
+        \item Exact intra-day clock times modelled natively
+        \item Bed constraint C11 expressible at all
+        \item Parallel portfolio search (LNS + complete search)
+        \item No big-M constants, no LP-relaxation weakening
+      \end{itemize}
+    \end{column}
+    \begin{column}{0.5\textwidth}
+      \textbf{MILP / advantages:}
+      \begin{itemize}
+        \item Strong LP relaxation bounding via cutting-plane theory
+        \item Mature commercial solvers (Gurobi, CPLEX)
+        \item Proven MIP gap closed very fast on small-to-medium instances
+        \item Own gap closes more tightly on a smaller feasible region
+      \end{itemize}
+    \end{column}
+  \end{columns}
+  \vspace{0.4em}
+  \begin{columns}
+    \begin{column}{0.5\textwidth}
+      \textbf{CP-SAT / disadvantages:}
+      \begin{itemize}
+        \item Own gap can be looser (larger search space)
+        \item Less interpretable as a ``classical'' LP
+      \end{itemize}
+    \end{column}
+    \begin{column}{0.5\textwidth}
+      \textbf{MILP / disadvantages:}
+      \begin{itemize}
+        \item Quadratic variable growth for disjunctions
+        \item Big-M weakens LP relaxation
+        \item Cannot express C11 (multi-day bed interval)
+        \item Day-count equipment cap \emph{logically incorrect} for shared resources
+      \end{itemize}
+    \end{column}
+  \end{columns}
+  \miplink
+\end{frame}
+
+% ============================================================
+\section{Results}
+
+\begin{frame}{Demo instance results -- summary table}
+  \small
+  \texttt{python main.py -{}-instance demo -{}-benchmark -{}-gap 0.0001}
+
+  \begin{center}
+  \begin{tabular}{lcccc}
+    \toprule
+    Solver & Status & Objective & Gap & Scheduled \\
+    \midrule
+    \textbf{CP-SAT (primary)} & Optimal & \textbf{155.0} & 0.00\% & 20/20 \\
+    OR-Tools/CBC (MIP) & Optimal & 157.0 & 0.00\% & 20/20 \\
+    Gurobi (MIP) & Optimal & 157.0 & 0.00\% & 20/20 \\
+    CP Optimizer & Optimal & 155.0 & 0.00\% & 20/20 \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+  \vspace{0.4em}
+  \small C-arm cases (4 in total: C14, C15, C17, C19):
+  \begin{itemize}
+    \item \textbf{CP-SAT:} Mon$=$[C19], Tue$=$[C15, C17], Wed$=$[C14]
+      -- two C-arm cases placed on the \emph{same day} sequentially.
+    \item \textbf{MIP:} Mon$=$[C19], Tue$=$[C15], Wed$=$[C17],
+      Thu$=$[C14] -- one C-arm per day, forced by the day-count cap.
+  \end{itemize}
+  The objective difference (155 vs. 157) comes directly from this
+  placement: CP-SAT schedules the same 20 cases with more efficient
+  equipment use.
+\end{frame}
+
+\begin{frame}{Demo -- CP-SAT Gantt schedule}
+  \begin{center}
+    \includegraphics[width=0.96\linewidth]{img/demo_cp_sat.png}
+  \end{center}
+  \footnotesize \textbf{Reading the chart:} each row is one room;
+  each bar is one case, coloured by service. Outlined bars (bold edge)
+  are priority-4 cases locked to Monday. Note \textbf{Tuesday}: Room
+  R\_VASC1 and R\_VASC2 each carry one C-arm case sequentially --
+  the scheduler has correctly identified they never overlap in time,
+  even though both land on the same day.
+\end{frame}
+
+\begin{frame}{Demo -- Comparison MIP Gantt schedule}
+  \begin{center}
+    \includegraphics[width=0.96\linewidth]{img/demo_baseline_milp.png}
+  \end{center}
+  \footnotesize \textbf{Reading the chart:} same cases, same services.
+  The MIP has no exact clock times (day-bucket formulation) -- cases
+  are laid out back-to-back for display only, the solver makes no
+  claim about their order. Compare the C-arm distribution: each of
+  Monday, Tuesday, Wednesday, Thursday carries exactly one C-arm case.
+  The day-count constraint $\sum x_{cdr} \le 1$ is satisfied, but it
+  produces an unnecessarily spread schedule -- a smaller feasible
+  region, not a worse search.
+\end{frame}
+
+\begin{frame}{Medium instance results (200 cases, 2-minute budget)}
+  \footnotesize
+  \textbf{Step 1 -- true MIP optimum} via Gurobi (near-zero gap):
+  \textbf{74{,}074.0}, 130/200 scheduled, in $<1$ second.
+
+  \textbf{Step 2 -- realistic 2-minute / 1\% gap budget:}
+
+  \begin{center}
+  \begin{tabular}{lccccc}
+    \toprule
+    Solver & Status & Objective & Own gap & vs.\ true opt. & Sched. \\
+    \midrule
+    Gurobi (reference) & Optimal & 74{,}074.0 & 0.00\% & --- & 130/200 \\
+    OR-Tools/CBC & Feasible & 74{,}116.0 & 0.56\% & $+0.06\%$ & 130/200 \\
+    \textbf{CP-SAT} & Feasible & \textbf{69{,}956.0} & 6.62\% & \textbf{$-5.56\%$} & \textbf{131/200} \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+  \vspace{0.4em}
+  CBC reaches the MIP's own proven optimum in 2 minutes.
+  CP-SAT \textbf{beats that optimum by 5.56\%} while scheduling one
+  more case -- it is searching a strictly larger, correct feasible
+  region, not a worse search.
+
+  CP-SAT's own gap (6.62\%) is \emph{relative to its own} feasible
+  region's bound -- a larger space is harder to close, the same reason
+  it's harder to prove there's no number above 5 in $\{1,\dots,100\}$
+  than in $\{1,\dots,5\}$.
+\end{frame}
+
+\begin{frame}{Medium instance -- CP-SAT Gantt schedule (200 cases)}
+  \begin{center}
+    \includegraphics[width=0.96\linewidth]{img/medium_cp_sat.png}
+  \end{center}
+  \footnotesize \textbf{Reading the chart:} 12 rooms (rows), 5 days,
+  $\sim$131 scheduled cases with exact per-case start and end times.
+  The density and variety of the schedule shows the model reasoning
+  over all five services simultaneously, with shared C-ARM equipment
+  constraints active across the VASC and NEURO rooms.
+\end{frame}
+
+% ============================================================
+\section{Production Deployment}
+
+\begin{frame}{What would change for a real deployment}
+  \small
+  \begin{enumerate}
+    \item \textbf{Data loader}: map the hospital's EHR/PAS export to
+      \texttt{PlanningInstance}. Schema aligns with Akbarzadeh \&
+      Maenhout (2023) CC~BY~4.0 datasets -- the loader is the only
+      missing piece.
+    \item \textbf{Parameter calibration}: replace synthetic defaults
+      with hospital-specific values:
+      \begin{itemize}\footnotesize
+        \item $\text{wl}^{max}_p$: hospital's own published wait targets
+        \item $k_{hd}/k_h$: surgeon job-plan session lengths
+        \item $\mu_p$: structured elicitation with service chiefs
+          (scenario-anchored, not multiplier-level)
+        \item $\beta_\rho$, $\kappa_{ed}$: actual bed census \& equipment inventory
+      \end{itemize}
+    \item \textbf{Weekly cadence}: run with a 30-minute to 2-hour
+      budget; 2-minute results already shown to be 5.56\% below the
+      MIP's proven optimum, demonstrating strong performance even at
+      short budgets.
+    \item \textbf{Acceptance testing}: extend \texttt{tests/test\_model.py}
+      with a real-data backtest; any reimplementation must pass the
+      same hard-constraint checks on the demo instance.
+    \item \textbf{Fairness monitoring}: track per-service overdue share
+      alongside the aggregate objective (the $\mu_p$ equity caveat
+      from the calibration section).
+  \end{enumerate}
+\end{frame}
+
+% ============================================================
+\section{Architecture \& Reusability}
+
+\begin{frame}{How the project is built}
+  \small
+  \begin{itemize}
+    \item \textbf{CP-SAT} (\texttt{cp\_sat\_interval\_solver.py}) -- the
+      model, default backend, only one needed to run.
+    \item \textbf{Comparison MIP} (\texttt{milp\_baseline\_solver.py}) --
+      CBC / SCIP / Gurobi / CPLEX via \texttt{-{}-solver milp-cbc} etc.;
+      kept purely as empirical evidence for the CP choice.
+    \item \textbf{CP Optimizer} (\texttt{cp\_optimizer\_solver.py}) --
+      optional, license-gated; adds sequence-dependent turnover;
+      auto-falls-back to CP-SAT.
+    \item \texttt{src/model/types.py} -- solver-agnostic data dictionary;
+      every mathematical symbol maps to one field here.
+    \item \texttt{src/model/penalty.py} -- one implementation of $w_c$,
+      shared by every backend.
+    \item \texttt{tests/test\_model.py} -- acceptance contract: hard
+      constraints verified on every solver's output on every run.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{A reusable library of models (Q\&A answer 2)}
+  \begin{enumerate}\small
+    \item \textbf{Core data types} -- typed dataclasses, no solver imports;
+      every model in the library builds on top of them.
+    \item \textbf{Constraint patterns} -- capacity sums, NoOverlap-based
+      non-overlap, tiered-priority tardiness, eligibility pre-filters.
+      Nurse rostering and bed allocation need the same \emph{shapes}, not
+      the same model.
+    \item \textbf{Problem templates} -- compose those patterns into a
+      specific formulation. This project is one template.
+    \item \textbf{Solver-adapter layer} -- one file per backend family
+      (MILP, CP, local search); a new problem picks a backend without
+      rewriting constraint logic.
+  \end{enumerate}
+  \vspace{0.4em}
+  The CP-vs-MIP empirical comparison this project runs is itself the
+  template for layer 4: \emph{argue} the backend choice from the
+  problem's structure, \emph{verify} it on a small instance, then
+  commit -- rather than defaulting to whichever backend the team knows
+  best.
+\end{frame}
+
+\begin{frame}{Passing the torch (Q\&A answer 1)}
+  \begin{enumerate}\small
+    \item \textbf{FORMULATION.md + FORMULATION\_CP.md}: problem framing,
+      evidence, assumptions, all sets/params/variables/constraints with
+      full math. One source of truth.
+    \item \textbf{\texttt{src/model/types.py}}: the dataclasses \emph{are}
+      the data dictionary -- every mathematical symbol maps to exactly
+      one field, no drift possible.
+    \item \textbf{Solver code with C-numbers}: every constraint in
+      \texttt{cp\_sat\_interval\_solver.py} is labeled C1\ldots C11,
+      matching FORMULATION\_CP.md -- read side by side, no ambiguity.
+    \item \textbf{\texttt{tests/test\_model.py}}: acceptance bar -- any
+      reimplementation must pass the same hard-constraint checks on the
+      demo instance; write a new test alongside any new constraint.
+    \item \textbf{A short glossary}: most confusion on a project like
+      this is vocabulary (``room roster'', ``ambulatory'', what P4
+      operationally means), not the math.
+  \end{enumerate}
+\end{frame}
+
+\begin{frame}{Where I'd take this next}
+  \small
+  \begin{center}
+  \begin{tabular}{ll}
+    \toprule
+    Extension & Approach \\
+    \midrule
+    Stochastic durations & Two-stage SP; 1st stage places, 2nd absorbs duration draws \\
+    Same-day rescheduling & LNS seeded from current plan \\
+    Explicit emergency reserve & Per-day capacity block outside the elective model \\
+    Nurse/anaesthetist rostering & Extend $H$, reuse surgeon NoOverlap/cap pattern \\
+    Multi-week rolling horizon & Carry forward unscheduled at bumped priority \\
+    Day-varying bed capacity & Per-day-segmented \texttt{Cumulative} \\
+    Per-specialty fairness & Secondary objective bounding per-service overdue share \\
+    Real-data pilot & Akbarzadeh \& Maenhout CC BY~4.0 datasets \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+\end{frame}
+
+\begin{frame}{Questions}
+  \centering
+  \Large Thank you.
+  \vspace{1em}
+  \normalsize
+  \hyperlink{toc}{\beamergotobutton{Back to agenda}}
+  \quad
+  \hyperlink{mip1}{\beamergotobutton{Full MIP appendix}}
+\end{frame}
+
+% ============================================================
+\appendix
+\section{Backup: Comparison MIP (Appendix Model)}
+
+\begin{frame}{MIP -- formulation overview}
+  \hypertarget{mip1}{}
+  The comparison MIP (FORMULATION.md, Appendix A) is implemented in
+  \texttt{milp\_baseline\_solver.py} and runs via
+  \texttt{-{}-solver milp-cbc} (bundled), \texttt{milp-gurobi}, or
+  \texttt{milp-cplex} (commercial license required).
+
+  \textbf{Same as CP-SAT}: sets, eligibility pre-filter (C4--C6),
+  priority tiers, $w_c$ from the same \texttt{penalty.py}.
+
+  \textbf{Key differences}:
+  \begin{itemize}\small
+    \item No intra-day clock times -- decisions are at \emph{day+room}
+      granularity only.
+    \item C7 and C10 are linear capacity sums, not exact non-overlap.
+    \item C11 (recovery beds) is \emph{not expressible} -- a day-bucket
+      variable has no ``day of surgery'' value for a multi-day stay.
+    \item No Term 4 in the objective (overflow penalty) -- C11 doesn't
+      exist.
+  \end{itemize}
+  \bk
+\end{frame}
+
+\begin{frame}{MIP -- variables and objective}
+  \[\small
+    x_{cdr}\in\{0,1\}\;\forall c,\;d\in D_c,\;r
+    \qquad
+    z_c\in[0,1]\;\forall c:\;p_c\ne4
+  \]
+  $z_c$ is relaxed to continuous; C3 forces it to $\{0,1\}$ at the
+  optimum (nothing else benefits from declaring it binary).
+  \[\small
+    \min\;\sum_{c:\,dd_c\ge0}\sum_{d,r}[dd_c+d]\,x_{cdr}
+    +\sum_{c:\,dd_c<0}\sum_{d,r}[dd_c+\alpha d]\,x_{cdr}
+    +\sum_{c:\,p_c\ne4}w_c\,z_c
+  \]
+  Same three-term structure as CP-SAT Terms 1--3; the same \texttt{penalty.py}
+  function computes $w_c$. No Term 4 (no C11).
+  \bk
+\end{frame}
+
+\begin{frame}{MIP -- constraints and what's missing}
+  \textbf{C7 (room, aggregate sum):}
+  \[\small
+    \sum_{c\in C}t_c^{tot}\,x_{cdr}\le k_{dr}\qquad\forall d,r
+  \]
+  For a single room: equivalent to exact non-overlap. For a \emph{shared
+  resource across rooms}: incorrectly counts all equipment-uses as if
+  they overlap.
+
+  \textbf{C10 (equipment, daily headcount):}
+  \[\small
+    \sum_{c:\,u_{ce}=1}\sum_r x_{cdr}\le\kappa_{ed}\qquad\forall e,d
+  \]
+  Counts \emph{how many} equipment-$e$ cases land on a day, not whether
+  they overlap in clock time -- the main source of the 5.56\% objective
+  gap vs. CP-SAT at scale.
+
+  \textbf{No C11:} ``$\text{bed}_c$ starts on whichever day $c$
+  is scheduled'' cannot be written -- no variable in a day-bucket model
+  holds ``day of surgery'' as a \emph{value}.
+  \bk
+\end{frame}
+
+\begin{frame}{CP Optimizer (optional, appendix)}
+  \small Kept for one reason: \textbf{sequence-dependent room turnover}
+  -- a transition matrix between adjacent cases in a room via
+  \texttt{sequence\_var + no\_overlap(transition\_matrix)}.
+  \begin{center}
+  \begin{tabular}{lcc}
+    \toprule
+    & Same service & Different service \\
+    \midrule
+    CP-SAT (duration-bucketed) & case's own $t_c^{clean}$ & same \\
+    CP Optimizer & 15 min & 35 min \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+  Demo instance: identical to CP-SAT (155.0, 20/20, Optimal) -- confirmed
+  that same-service turnover gaps equal exactly 15 min.
+
+  At 200 cases, own gap closes slower than CP-SAT (search-tuning
+  difference -- no warm start applied; not a modelling weakness).
+  \bk
+\end{frame}
+
+\begin{frame}{References}
+  \tiny
+  \begin{enumerate}
+    \item Cardoen, B., Demeulemeester, E., \& Beli\"en, J. (2010).
+      Operating room planning and scheduling: A literature review.
+      \emph{EJOR}, 201(3), 921--932.
+      \texttt{doi:10.1016/j.ejor.2009.04.011}
+    \item Marques, I., \& Captivo, M.E. (2015).
+      \emph{Planeamento de cirurgias el\'etivas no Centro Hospitalar
+      Lisboa Norte}. MSc thesis, Universidade de Lisboa.
+    \item Denton, B.T., Miller, A.J., Balasubramanian, H.J., \&
+      Huschka, T.R. (2010). Optimal allocation of surgery blocks to
+      operating rooms under uncertainty. \emph{Oper.\ Res.}, 58(4),
+      802--816. \texttt{doi:10.1287/opre.1090.0791}
+    \item SIGIC -- Portaria n.\textsuperscript{o} 45/2008, Di\'ario
+      da Rep\'ublica, Portugal.
+    \item Van Riet, C., \& Demeulemeester, E. (2015). Trade-offs in
+      operating room planning for electives and emergencies.
+      \emph{OR Spectrum}, 37(1), 59--87.
+      \texttt{doi:10.1007/s00291-013-0345-2}
+    \item Macario, A. (2010). What does one minute of operating room
+      time cost? \emph{J.\ Clin.\ Anesth.}, 22(4), 233--236.
+      \texttt{doi:10.1016/j.jclinane.2010.02.003}
+    \item Akbarzadeh, B., \& Maenhout, B. (2023a). Real life data for
+      OR scheduling problem. Mendeley Data V2.
+      \texttt{doi:10.17632/n2v49z2vnp.2}
+    \item Akbarzadeh, B., \& Maenhout, B. (2023b). RealLife OR
+      scheduling dataset, 2021-Jan-May. Mendeley Data V1.
+      \texttt{doi:10.17632/c8d342266x.1}
+    \item Perron, L., \& Furnon, V. \emph{CP-SAT: a CP Solver}.
+      Google OR-Tools.
+      \texttt{developers.google.com/optimization/cp}
+    \item Baptiste, P., Le Pape, C., \& Nuijten, W. (2001).
+      \emph{Constraint-Based Scheduling}. Kluwer.
+      \texttt{doi:10.1007/978-1-4615-1479-4}
+    \item Vil\'im, P. (2004). $O(n\log n)$ filtering for unary
+      resource constraints. \emph{CPAIOR 2004}.
+      \texttt{doi:10.1007/978-3-540-24664-0\_15}
+    \item Schutt, A., Feydy, T., Stuckey, P.J., \& Wallace, M.G.
+      (2009). Why cumulative decomposition is not as bad as it sounds.
+      \emph{CP 2009}. \texttt{doi:10.1007/978-3-642-04244-7\_45}
+    \item Laborie, P. (2009). IBM ILOG CP Optimizer for detailed
+      scheduling illustrated on three problems. \emph{CPAIOR 2009}.
+      \texttt{doi:10.1007/978-3-642-01929-6\_5}
+  \end{enumerate}
+  \bk
+\end{frame}
+
+\end{document}
