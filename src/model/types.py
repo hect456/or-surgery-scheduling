@@ -17,6 +17,7 @@ is a PlanningInstance field a hospital can override with its own policy.
 from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import IntEnum
+from functools import cached_property
 from typing import Dict, List, Optional, Tuple
 
 
@@ -231,15 +232,18 @@ class PlanningInstance:
         assert self.alpha > 1.0, "alpha must be > 1"
 
     # ── Convenience lookups ──────────────────────
-    @property
+    # cached_property: built once per instance, not on every access.
+    # Regular @property would rebuild the dict on every call — these are
+    # used inside solver inner loops and test assertions.
+    @cached_property
     def cases_by_id(self) -> Dict[str, SurgicalCase]:
         return {c.id: c for c in self.cases}
 
-    @property
+    @cached_property
     def surgeons_by_id(self) -> Dict[str, Surgeon]:
         return {s.id: s for s in self.surgeons}
 
-    @property
+    @cached_property
     def rooms_by_id(self) -> Dict[str, OperatingRoom]:
         return {r.id: r for r in self.rooms}
 
@@ -313,5 +317,15 @@ class SolverResult:
     solver_name: str
     gap: Optional[float] = None              # MIP/CP gap (if available)
 
-    def is_optimal(self) -> bool:
+    def has_solution(self) -> bool:
+        """True if a feasible schedule was found (status Optimal or Feasible).
+        'Optimal' means proven within the configured gap; 'Feasible' means a
+        valid solution exists but optimality wasn't proved in the time budget.
+        Either way the assignments list is usable."""
         return self.status.lower() in {"optimal", "feasible"}
+
+    def is_optimal(self) -> bool:
+        """Alias for has_solution() — kept for backward compatibility.
+        Note: returns True for 'Feasible' status too, not only when the
+        gap is proven zero. Check self.gap for the actual proven bound."""
+        return self.has_solution()

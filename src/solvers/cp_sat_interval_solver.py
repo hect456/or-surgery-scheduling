@@ -71,6 +71,8 @@ class CPSATIntervalSolver(BaseSolver):
         case_map = instance.cases_by_id
         surg_map = instance.surgeons_by_id
         penalties = compute_all_penalties(instance)
+        # O(1) lookup for day-name → index; passed into recovery-bed builder
+        # so it avoids calling list.index() in an inner loop.
         day_index = {d: i for i, d in enumerate(days)}
 
         # ── Feasible (c, d, r) candidate slots — same filter as baseline ──
@@ -243,7 +245,8 @@ class CPSATIntervalSolver(BaseSolver):
         # horizon.
         if instance.has_bed_limits():
             self._add_recovery_bed_constraints(
-                model, instance, candidates, presence, is_scheduled, objective_terms
+                model, instance, candidates, presence, is_scheduled,
+                objective_terms, day_index
             )
         model.Minimize(sum(objective_terms))
 
@@ -257,7 +260,11 @@ class CPSATIntervalSolver(BaseSolver):
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = float(self.time_limit_sec)
         solver.parameters.relative_gap_limit = self.mip_gap
-        solver.parameters.num_search_workers = min(8, os.cpu_count() or 8)
+        # Use all available logical cores, capped at 16 — beyond that,
+        # CP-SAT's clause-sharing overhead tends to outweigh the added
+        # search diversity on instances of this size. The cap at 8 in the
+        # previous version was too conservative on 10-16 core machines.
+        solver.parameters.num_search_workers = min(16, os.cpu_count() or 4)
         solver.parameters.log_search_progress = self.log_search_progress
         status = solver.Solve(model)
 
@@ -311,9 +318,13 @@ class CPSATIntervalSolver(BaseSolver):
 
     @staticmethod
     def _add_recovery_bed_constraints(model, instance, candidates, presence, is_scheduled,
-                                       objective_terms):
-        days = instance.days
-        n_days = len(days)
+                                       objective_terms, day_index):
+        """
+        C11: recovery/ICU bed AddCumulative, day-granularity.
+        day_index is the pre-built {day_name: int_index} dict — avoids
+        calling list.index() (O(n)) inside an inner loop over candidates.
+        """
+        n_days = len(instance.days)
         overflow_penalty = int(round(instance.weekend_bed_overflow_penalty))
 
         beds_by_type: Dict[str, list] = defaultdict(list)
@@ -324,7 +335,8 @@ class CPSATIntervalSolver(BaseSolver):
             for (cid, d, rid) in candidates:
                 if cid != c.id:
                     continue
-                model.Add(day_of == instance.days.index(d)).OnlyEnforceIf(presence[(cid, d, rid)])
+                # O(1) lookup instead of list.index() O(n)
+                model.Add(day_of == day_index[d]).OnlyEnforceIf(presence[(cid, d, rid)])
 
             sched = is_scheduled[c.id]
             bed_start = day_of

@@ -119,15 +119,29 @@ with $\rho(c)\ne\text{none}$, channel whichever $(d,r)$ slot gets chosen into a 
 index, then treat the stay as its own interval:
 
 $$\text{dayof}_c = d_{idx} \quad\text{(via \texttt{OnlyEnforceIf}, whenever }\text{pr}_{cdr}=1\text{)}$$
-$$\text{bed}_c = \texttt{NewOptionalIntervalVar}(\text{dayof}_c,\,\text{los}_c,\,\text{dayof}_c+\text{los}_c,\,1-u_c)$$
+
+The bed interval's presence literal differs by case type:
+
+$$
+\text{bed}_c = \begin{cases}
+\texttt{NewOptionalIntervalVar}(\text{dayof}_c,\,\text{los}_c,\,\text{dayof}_c+\text{los}_c,\,1-u_c)
+  & \text{if } p_c \ne 4 \\
+\texttt{NewIntervalVar}(\text{dayof}_c,\,\text{los}_c,\,\text{dayof}_c+\text{los}_c)
+  & \text{if } p_c = 4
+\end{cases}
+$$
+
+Priority-4 cases have no $u_c$ (they are always scheduled by C2), so their bed interval
+is mandatory rather than conditional. For all other cases, the presence literal $1-u_c$
+ensures the interval only occupies capacity when the case is actually scheduled.
+
 $$\texttt{AddCumulative}\big(\{\text{bed}_c:\rho(c)=\rho\},\,\text{demands}=1,\,\text{capacity}=\beta_\rho\big) \qquad \forall \rho$$
 
-The bed interval's presence literal is $1-u_c$, so it only occupies capacity for a case
-that's actually scheduled. Bed capacity $\beta_\rho$ is constant across the week, but a
-stay starting late in the horizon (a 2-day stay starting Friday, say) can run past it
-into what would be the weekend — a regime this constant-capacity model has no separate,
-lower capacity for. Rather than silently approximate that or forbid it outright, every
-day of overflow is charged in the objective:
+Bed capacity $\beta_\rho$ is constant across the week. A stay starting late in the
+horizon (a 2-day stay starting Friday, say) can run past it into what would be the
+weekend — a regime this constant-capacity model has no separate, lower capacity for.
+Rather than silently approximate that or forbid it outright, every day of overflow is
+charged in the objective:
 
 $$\text{overflow}_c = \max\big(0,\ (\text{dayof}_c+\text{los}_c) - n_{days}\big), \qquad \pi^{ovf}\cdot\text{overflow}_c \text{ added to Term 4}$$
 
@@ -146,10 +160,13 @@ two different `end`s for the two different resources that slot touches.
 
 ## 6. Search
 
-CP-SAT runs with its default parallel portfolio (`num_search_workers`, capped at the
-machine's core count) and a relative gap target rather than a hand-written branching
-strategy — see FORMULATION.md §3 for why that's the right default here rather than a
-shortcut. The reported gap is always the genuine bound-vs-incumbent gap, computed even
+CP-SAT runs with its default parallel portfolio (`num_search_workers`, capped at
+`min(16, os.cpu_count())`) and a relative gap target rather than a hand-written
+branching strategy — see FORMULATION.md §3 for why that's the right default here
+rather than a shortcut. The cap at 16 is a deliberate choice: below 8 cores the cap
+has no effect; between 8 and 16 the full count is used; above 16, clause-sharing
+overhead begins to outweigh the added search diversity for instances of this size.
+The reported gap is always the genuine bound-vs-incumbent gap, computed even
 when the status is `Optimal`: with a relative gap target set, CP-SAT's `Optimal` means
 "proven within that tolerance," the same convention Gurobi uses, not necessarily a
 literal 0%.

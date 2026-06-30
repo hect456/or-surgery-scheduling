@@ -31,7 +31,7 @@ from typing import Dict
 from .types import SurgicalCase, PlanningInstance
 
 
-def penalty_factor_curve(days_to_deadline: int) -> float:
+def penalty_factor_curve(days_to_deadline: int) -> int:
     """Piecewise penalty factor, in priority-1-equivalent overdue days."""
     d = days_to_deadline
     if d >= 90:
@@ -63,8 +63,8 @@ def compute_penalty(
 ) -> float:
     """w_c for one case, under this instance's priority policy."""
     mult = instance.priority_multiplier[case.priority]
-    dtd = instance.days_to_deadline(case)
-    fp = penalty_factor_curve(int(round(dtd)))
+    dtd = instance.days_to_deadline(case)   # already an int
+    fp = penalty_factor_curve(dtd)
     displacement = 1.2 * max_days_to_deadline
     return mult * fp + displacement
 

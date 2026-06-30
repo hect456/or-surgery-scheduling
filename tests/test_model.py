@@ -241,12 +241,36 @@ def test_cp_optimizer_fallback_method_is_correct():
     _assert_hard_constraints(inst, result)
 
 
-def test_medium_instance_feasible():
+def test_medium_instance_milp_feasible():
+    """MILP baseline on a 60-case slice — quick feasibility smoke test."""
     inst   = medium_instance(seed=1, n_cases=60)
     solver = MILPBaselineSolver(backend="CBC", time_limit_sec=60, mip_gap=0.05)
     result = solver.solve(inst)
-    assert result.is_optimal(), f"Medium instance: {result.status}"
+    assert result.has_solution(), f"Medium instance MILP: {result.status}"
     _assert_hard_constraints(inst, result)
+
+
+def test_medium_instance_cp_sat_feasible():
+    """Primary CP-SAT model on a 60-case slice.
+    The full 200-case run is in main.py --benchmark; this covers the
+    primary solver's hard constraints on a medium-sized instance without
+    hitting the test-suite time budget.
+    Key check: the exact room NoOverlap and equipment Cumulative that the
+    comparison MILP cannot express (FORMULATION.md §3) are exercised here."""
+    inst   = medium_instance(seed=1, n_cases=60)
+    solver = CPSATIntervalSolver(time_limit_sec=30, mip_gap=0.05)
+    result = solver.solve(inst)
+    assert result.has_solution(), f"Medium instance CP-SAT: {result.status}"
+    _assert_hard_constraints(inst, result)
+    # Room exact non-overlap — the constraint CP-SAT expresses that MILP can't
+    by_room_day = defaultdict(list)
+    for a in result.assignments:
+        by_room_day[a.day, a.room_id].append(a)
+    for items in by_room_day.values():
+        items.sort(key=lambda a: a.start_min)
+        for prev, cur in zip(items, items[1:]):
+            assert prev.end_min <= cur.start_min, \
+                f"CP-SAT medium: overlapping room intervals ({prev.case_id}, {cur.case_id})"
 
 
 if __name__ == "__main__":
@@ -256,7 +280,8 @@ if __name__ == "__main__":
         test_milp_and_cp_sat_agree_demo_is_fully_schedulable,
         test_cp_optimizer_solver,
         test_cp_optimizer_fallback_method_is_correct,
-        test_medium_instance_feasible,
+        test_medium_instance_milp_feasible,
+        test_medium_instance_cp_sat_feasible,
     ]
     passed = 0
     failed = 0
